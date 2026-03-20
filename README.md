@@ -18,10 +18,17 @@ This version is confirmed working and includes:
 git clone https://github.com/Xipzer/opencode-anthropic-oauth-fix.git
 cd opencode-anthropic-oauth-fix
 chmod +x install.sh
-./install.sh
+bash ./install.sh
 ```
 
 Then restart OpenCode/Kimaki or start a fresh session.
+
+If you ever see `/usr/bin/env: 'bash\r': Permission denied`, your checkout converted the script to CRLF line endings. Fix it once with:
+
+```bash
+sed -i 's/\r$//' install.sh
+bash ./install.sh
+```
 
 ## What gets installed
 

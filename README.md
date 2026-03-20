@@ -1,6 +1,6 @@
 # Opencode Anthropic OAuth Fix
 
-Private patch repo for restoring Anthropic Claude Pro/Max OAuth in OpenCode/Kimaki.
+Patch repo for restoring Anthropic Claude Pro/Max OAuth in OpenCode/Kimaki.
 
 This version is confirmed working and includes:
 
@@ -15,7 +15,7 @@ This version is confirmed working and includes:
 ## Quick install
 
 ```bash
-git clone <private-repo-url>
+git clone https://github.com/Xipzer/opencode-anthropic-oauth-fix.git
 cd opencode-anthropic-oauth-fix
 chmod +x install.sh
 ./install.sh

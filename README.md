@@ -5,8 +5,11 @@ Patch repo for restoring Anthropic Claude Pro/Max OAuth in OpenCode/Kimaki.
 This version is confirmed working and includes:
 
 - Anthropic OAuth login restoration
+- labeled multi-account Anthropic OAuth support
 - local `localhost` auto callback flow
 - manual/remote fallback flow for SSH, WSL, and JetBrains Remote
+- manual switching between saved Anthropic accounts
+- automatic failover to another saved account on Anthropic rate limits
 - token auto-refresh
 - Claude Code-style runtime request shaping
 - debug logging for auth failures
@@ -35,19 +38,31 @@ bash ./install.sh
 - `~/.config/opencode/package.json`
 - `~/.config/opencode/opencode.json`
 - `~/.config/opencode/plugins/opencode-anthropic-auth.ts`
+- `~/.config/opencode/anthropic-accounts.json` (created after you save accounts)
 
 ## Anthropic methods added
 
-- `Claude Pro/Max`
-- `Claude Pro/Max (Manual / Remote)`
+- `Add Claude Pro/Max Account`
+- `Add Claude Pro/Max Account (Manual / Remote)`
+- `Use saved account: <label>`
 - `Create an API Key`
 - `Create an API Key (Manual / Remote)`
 - `Manually enter API Key`
 
+## Multi-account flow
+
+1. Run `opencode providers login --provider anthropic`
+2. Choose `Add Claude Pro/Max Account` or `Add Claude Pro/Max Account (Manual / Remote)`
+3. Enter a label such as `personal`, `work`, or `backup`
+4. Repeat for as many Anthropic OAuth accounts as you want
+5. Switch manually later with `Use saved account: <label>`
+
+When Anthropic returns a `rate_limit_error`, the plugin will try another saved account automatically and replay the same request.
+
 ## Which method to use
 
-- `Claude Pro/Max`: use when browser and OpenCode run on the same machine and `localhost` callback works
-- `Claude Pro/Max (Manual / Remote)`: use for JetBrains Remote, SSH, WSL, and split browser/terminal setups
+- `Add Claude Pro/Max Account`: use when browser and OpenCode run on the same machine and `localhost` callback works
+- `Add Claude Pro/Max Account (Manual / Remote)`: use for JetBrains Remote, SSH, WSL, and split browser/terminal setups
 
 ## Verify
 

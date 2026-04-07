@@ -8,8 +8,11 @@ This version is confirmed working and includes:
 - labeled multi-account Anthropic OAuth support
 - local `localhost` auto callback flow
 - manual/remote fallback flow for SSH, WSL, and JetBrains Remote
+- recovery from overwritten/stale pending manual OAuth attempts
 - manual switching between saved Anthropic accounts
 - automatic failover to another saved account on Anthropic rate limits
+- periodic background refresh for saved Anthropic accounts to keep them warm
+- quarantine of accounts whose refresh tokens are invalid
 - token auto-refresh
 - Claude Code-style runtime request shaping
 - debug logging for auth failures
@@ -39,6 +42,18 @@ bash ./install.sh
 - `~/.config/opencode/opencode.json`
 - `~/.config/opencode/plugins/opencode-anthropic-auth.ts`
 - `~/.config/opencode/anthropic-accounts.json` (created after you save accounts)
+- `~/.config/opencode/anthropic-pending-oauth.json` (created during manual auth flows)
+
+## Architecture
+
+The patch adds a local Anthropic account manager on top of OpenCode's normal single-provider auth slot.
+
+- `anthropic-accounts.json` stores labeled saved OAuth accounts plus active-account state
+- the active account is mirrored back into OpenCode's canonical `auth.json`
+- manual auth attempts are tracked in `anthropic-pending-oauth.json` so stale/overwritten dialogs can still be redeemed safely
+- runtime requests use the active account and reactively fail over to another saved account on Anthropic `429` responses
+- saved accounts are refreshed periodically in the background so inactive accounts do not silently rot
+- accounts with invalid refresh tokens are quarantined instead of being retried forever
 
 ## Anthropic methods added
 
@@ -58,6 +73,8 @@ bash ./install.sh
 5. Switch manually later with `Use saved account: <label>`
 
 When Anthropic returns a `rate_limit_error`, the plugin will try another saved account automatically and replay the same request.
+
+By default, the patch does **not** poll Anthropic's `/api/oauth/usage` endpoint. It relies on reactive failover from real runtime `429`s because the usage endpoint is noisy and can be rate-limited independently. Usage polling can be re-enabled explicitly if you want it.
 
 ## Which method to use
 
@@ -98,6 +115,12 @@ If auth fails again, inspect:
 - `ANTHROPIC_BETA_FLAGS`
 - `ANTHROPIC_CLI_VERSION`
 - `ANTHROPIC_USER_AGENT`
+- `ANTHROPIC_BACKGROUND_REFRESH_INTERVAL_MS`
+- `ANTHROPIC_BACKGROUND_REFRESH_EXPIRY_MARGIN_MS`
+- `ANTHROPIC_ENABLE_USAGE_POLLING`
+- `ANTHROPIC_USAGE_CACHE_TTL_MS`
+- `ANTHROPIC_USAGE_RATE_LIMIT_BACKOFF_MS`
+- `ANTHROPIC_RATE_LIMIT_COOLDOWN_MS`
 
 ## Notes
 

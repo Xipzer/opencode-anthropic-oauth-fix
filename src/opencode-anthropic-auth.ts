@@ -11,6 +11,7 @@ const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME ?? path.join(HOME, ".co
 const DATA_DIR = path.join(process.env.XDG_DATA_HOME ?? path.join(HOME, ".local", "share"), "opencode")
 const AUTH_FILE = path.join(DATA_DIR, "auth.json")
 const ACCOUNTS_FILE = path.join(CONFIG_DIR, "anthropic-accounts.json")
+const PENDING_OAUTH_FILE = path.join(CONFIG_DIR, "anthropic-pending-oauth.json")
 
 const CLIENT_ID = process.env.ANTHROPIC_CLIENT_ID || "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 const CLAUDE_AI_AUTHORIZE_URL = process.env.ANTHROPIC_AUTHORIZE_URL || "https://claude.ai/oauth/authorize"
@@ -41,14 +42,19 @@ const CONSOLE_SCOPES = (process.env.ANTHROPIC_CONSOLE_SCOPES || "org:create_api_
   .filter(Boolean)
 const DEFAULT_IMPORTED_LABEL = process.env.ANTHROPIC_DEFAULT_ACCOUNT_LABEL || "default"
 const ACCOUNT_STRATEGY = process.env.ANTHROPIC_ACCOUNT_STRATEGY === "drain" ? "drain" : "balanced"
+const ENABLE_USAGE_POLLING = process.env.ANTHROPIC_ENABLE_USAGE_POLLING === "1"
+const BACKGROUND_REFRESH_INTERVAL_MS = numberEnv("ANTHROPIC_BACKGROUND_REFRESH_INTERVAL_MS", 12 * 60 * 60 * 1000)
+const BACKGROUND_REFRESH_EXPIRY_MARGIN_MS = numberEnv("ANTHROPIC_BACKGROUND_REFRESH_EXPIRY_MARGIN_MS", 24 * 60 * 60 * 1000)
 const FIVE_HOUR_THRESHOLD = numberEnv("ANTHROPIC_FIVE_HOUR_THRESHOLD", 100)
 const SEVEN_DAY_THRESHOLD = numberEnv("ANTHROPIC_SEVEN_DAY_THRESHOLD", 100)
 const USAGE_CACHE_TTL_MS = numberEnv("ANTHROPIC_USAGE_CACHE_TTL_MS", 60_000)
 const RATE_LIMIT_COOLDOWN_MS = numberEnv("ANTHROPIC_RATE_LIMIT_COOLDOWN_MS", 15 * 60_000)
+const USAGE_RATE_LIMIT_BACKOFF_MS = numberEnv("ANTHROPIC_USAGE_RATE_LIMIT_BACKOFF_MS", 10 * 60_000)
+const PENDING_ATTEMPT_TTL_MS = numberEnv("ANTHROPIC_PENDING_ATTEMPT_TTL_MS", 30 * 60_000)
 
 type Candidate = {
   code: string
-  state: string
+  state?: string
 }
 
 type OAuthSuccess = {
@@ -69,7 +75,9 @@ type AccountUsage = {
   sevenDaySonnet?: AccountUsageWindow
   sevenDayOpus?: AccountUsageWindow
   polledAt?: string
+  backoffUntil?: string
   tokenExpired?: boolean
+  refreshInvalid?: boolean
 }
 
 type StoredAccount = {
@@ -99,6 +107,23 @@ type AccountStore = {
   history: AccountHistoryEntry[]
 }
 
+type PendingOAuthAttempt = {
+  id: string
+  purpose: "account" | "api_key"
+  mode: "manual" | "auto"
+  authorizeUrl: string
+  redirectUri: string
+  verifier: string
+  createdAt: string
+  label?: string
+  makeActive?: boolean
+}
+
+type PendingOAuthStore = {
+  version: 1
+  attempts: PendingOAuthAttempt[]
+}
+
 type PreparedRequest = {
   original: RequestInfo | URL
   finalUrl: string | null
@@ -113,6 +138,11 @@ type ActiveSelection = {
   account: StoredAccount
 }
 
+type AnthropicBackgroundState = typeof globalThis & {
+  __anthropicBackgroundRefreshRunning?: Promise<void>
+  __anthropicBackgroundRefreshTimer?: ReturnType<typeof setInterval>
+}
+
 function numberEnv(name: string, fallback: number) {
   const value = Number(process.env[name])
   return Number.isFinite(value) ? value : fallback
@@ -120,6 +150,12 @@ function numberEnv(name: string, fallback: number) {
 
 function nowIso() {
   return new Date().toISOString()
+}
+
+function updatedTimestamp(value?: string) {
+  if (!value) return 0
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) ? timestamp : 0
 }
 
 function cleanInput(value: string) {
@@ -143,6 +179,13 @@ function emptyStore(): AccountStore {
     version: 1,
     accounts: {},
     history: [],
+  }
+}
+
+function emptyPendingOAuthStore(): PendingOAuthStore {
+  return {
+    version: 1,
+    attempts: [],
   }
 }
 
@@ -178,6 +221,17 @@ function normalizeStore(store: Partial<AccountStore> | undefined): AccountStore 
   }
 }
 
+function normalizePendingOAuthStore(store: Partial<PendingOAuthStore> | undefined): PendingOAuthStore {
+  const attempts = Array.isArray(store?.attempts)
+    ? store.attempts.filter((attempt): attempt is PendingOAuthAttempt => Boolean(attempt && typeof attempt === "object"))
+    : []
+
+  return {
+    version: 1,
+    attempts,
+  }
+}
+
 async function debugLog(event: string, data: Record<string, unknown>) {
   const payload = {
     time: nowIso(),
@@ -185,11 +239,34 @@ async function debugLog(event: string, data: Record<string, unknown>) {
     ...data,
   }
 
-  console.error(`[anthropic-auth] ${event}`, payload)
+  if (shouldConsoleLog(event, data)) {
+    console.error(`[anthropic-auth] ${event}`, payload)
+  }
   try {
     await mkdir(path.dirname(DEBUG_LOG), { recursive: true })
     await appendFile(DEBUG_LOG, `${JSON.stringify(payload)}\n`)
   } catch {}
+}
+
+function isRateLimitMessage(message: string) {
+  return /rate_limit_error|Rate limited/i.test(message)
+}
+
+function isInvalidRefreshMessage(message: string) {
+  return /invalid_grant|Refresh token not found or invalid/i.test(message)
+}
+
+function shouldConsoleLog(event: string, data: Record<string, unknown>) {
+  if (event === "token_retry_scheduled" && data.url === USAGE_API_URL) return false
+  if (
+    event === "usage_fetch_failed" &&
+    typeof data.message === "string" &&
+    isRateLimitMessage(data.message) &&
+    data.tokenExpired === false
+  ) {
+    return false
+  }
+  return true
 }
 
 async function readJson<T>(filePath: string, fallback: T): Promise<T> {
@@ -232,6 +309,12 @@ function usageValue(window?: AccountUsageWindow) {
 function usageTimestamp(usage?: AccountUsage) {
   if (!usage?.polledAt) return 0
   const value = Date.parse(usage.polledAt)
+  return Number.isFinite(value) ? value : 0
+}
+
+function usageBackoffTimestamp(usage?: AccountUsage) {
+  if (!usage?.backoffUntil) return 0
+  const value = Date.parse(usage.backoffUntil)
   return Number.isFinite(value) ? value : 0
 }
 
@@ -285,6 +368,85 @@ async function loadAccountStore() {
 
 async function saveAccountStore(store: AccountStore) {
   await writeJson(ACCOUNTS_FILE, store)
+}
+
+async function loadPendingOAuthStore() {
+  return normalizePendingOAuthStore(await readJson<Partial<PendingOAuthStore>>(PENDING_OAUTH_FILE, emptyPendingOAuthStore()))
+}
+
+async function savePendingOAuthStore(store: PendingOAuthStore) {
+  await writeJson(PENDING_OAUTH_FILE, store)
+}
+
+function isPendingAttemptFresh(attempt: PendingOAuthAttempt) {
+  const created = Date.parse(attempt.createdAt)
+  if (!Number.isFinite(created)) return false
+  return created > Date.now() - PENDING_ATTEMPT_TTL_MS
+}
+
+async function cleanupPendingOAuthAttempts() {
+  const store = await loadPendingOAuthStore()
+  const attempts = store.attempts.filter(isPendingAttemptFresh)
+  if (attempts.length !== store.attempts.length) {
+    store.attempts = attempts
+    await savePendingOAuthStore(store)
+  }
+  return store
+}
+
+async function registerPendingOAuthAttempt(attempt: PendingOAuthAttempt) {
+  const store = await cleanupPendingOAuthAttempts()
+  store.attempts = [...store.attempts.filter((item) => item.id !== attempt.id), attempt]
+  await savePendingOAuthStore(store)
+  return attempt
+}
+
+async function consumePendingOAuthAttempt(id: string) {
+  const store = await cleanupPendingOAuthAttempts()
+  const before = store.attempts.length
+  store.attempts = store.attempts.filter((attempt) => attempt.id !== id)
+  if (store.attempts.length !== before) {
+    await savePendingOAuthStore(store)
+  }
+}
+
+async function listPendingOAuthAttempts(filter: Partial<Pick<PendingOAuthAttempt, "purpose" | "mode" | "authorizeUrl" | "redirectUri">>) {
+  const store = await cleanupPendingOAuthAttempts()
+  return store.attempts.filter((attempt) => {
+    if (filter.purpose && attempt.purpose !== filter.purpose) return false
+    if (filter.mode && attempt.mode !== filter.mode) return false
+    if (filter.authorizeUrl && attempt.authorizeUrl !== filter.authorizeUrl) return false
+    if (filter.redirectUri && attempt.redirectUri !== filter.redirectUri) return false
+    return true
+  })
+}
+
+function createPendingOAuthAttempt(input: Omit<PendingOAuthAttempt, "id" | "createdAt">): PendingOAuthAttempt {
+  return {
+    id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+    createdAt: nowIso(),
+    ...input,
+  }
+}
+
+function rankPendingAttempts(
+  attempts: PendingOAuthAttempt[],
+  candidate: Candidate,
+  fallbackAttempt: PendingOAuthAttempt,
+) {
+  return [...attempts].sort((left, right) => {
+    const score = (attempt: PendingOAuthAttempt) => {
+      let value = 0
+      if (candidate.state && attempt.verifier === candidate.state) value += 100
+      if (attempt.id === fallbackAttempt.id) value += 10
+      return value
+    }
+
+    const leftScore = score(left)
+    const rightScore = score(right)
+    if (leftScore !== rightScore) return rightScore - leftScore
+    return Date.parse(right.createdAt) - Date.parse(left.createdAt)
+  })
 }
 
 async function ensureAccountStore() {
@@ -488,6 +650,9 @@ async function refreshStoredAccount(store: AccountStore, label: string, force = 
   if (!force && account.access && account.expires > Date.now() + 15_000) {
     return account
   }
+  if (!force && account.usage?.refreshInvalid) {
+    return account
+  }
 
   try {
     const refreshed = await refreshTokens(account.refresh)
@@ -499,16 +664,19 @@ async function refreshStoredAccount(store: AccountStore, label: string, force = 
       updatedAt: nowIso(),
       usage: {
         ...current.usage,
+        refreshInvalid: false,
         tokenExpired: false,
       },
     }))
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    const refreshInvalid = isInvalidRefreshMessage(message)
     await debugLog("account_refresh_failed", { label, message })
     await updateStoredAccount(store, label, (current) => ({
       ...current,
       usage: {
         ...current.usage,
+        refreshInvalid: refreshInvalid || current.usage?.refreshInvalid,
         tokenExpired: true,
         polledAt: nowIso(),
       },
@@ -520,7 +688,13 @@ async function refreshStoredAccount(store: AccountStore, label: string, force = 
 async function refreshStoredUsage(store: AccountStore, label: string, force = false) {
   const account = store.accounts[label]
   if (!account) throw new Error(`Unknown Anthropic account: ${label}`)
+  if (!ENABLE_USAGE_POLLING) {
+    return account
+  }
   if (!force && usageTimestamp(account.usage) > Date.now() - USAGE_CACHE_TTL_MS) {
+    return account
+  }
+  if (!force && usageBackoffTimestamp(account.usage) > Date.now()) {
     return account
   }
 
@@ -534,16 +708,78 @@ async function refreshStoredUsage(store: AccountStore, label: string, force = fa
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     const tokenExpired = /token_expired|OAuth token has expired|authentication_error/i.test(message)
-    await debugLog("usage_fetch_failed", { label, message, tokenExpired })
+    const rateLimited = isRateLimitMessage(message)
+    await debugLog("usage_fetch_failed", { label, message, tokenExpired, rateLimited })
     return await updateStoredAccount(store, label, (current) => ({
       ...current,
       usage: {
         ...current.usage,
         polledAt: nowIso(),
+        backoffUntil: rateLimited ? new Date(Date.now() + USAGE_RATE_LIMIT_BACKOFF_MS).toISOString() : current.usage?.backoffUntil,
         tokenExpired: tokenExpired || current.usage?.tokenExpired,
       },
     }))
   }
+}
+
+function shouldBackgroundRefreshAccount(account: StoredAccount) {
+  if (account.usage?.refreshInvalid) return false
+  if (account.expires <= Date.now() + BACKGROUND_REFRESH_EXPIRY_MARGIN_MS) return true
+  return updatedTimestamp(account.updatedAt) <= Date.now() - BACKGROUND_REFRESH_INTERVAL_MS
+}
+
+function backgroundState() {
+  return globalThis as AnthropicBackgroundState
+}
+
+async function refreshAllAccountsInBackground(client: Parameters<typeof BaseAnthropicAuthPlugin>[0]["client"]) {
+  const state = backgroundState()
+  if (state.__anthropicBackgroundRefreshRunning) {
+    return state.__anthropicBackgroundRefreshRunning
+  }
+
+  state.__anthropicBackgroundRefreshRunning = (async () => {
+    const store = await ensureAccountStore()
+    for (const label of sortedLabels(store)) {
+      const account = store.accounts[label]
+      if (!account || !shouldBackgroundRefreshAccount(account)) continue
+
+      try {
+        const refreshed = await refreshStoredAccount(store, label, true)
+        if (store.active === label) {
+          await setCanonicalAuth(client, refreshed)
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (!isInvalidRefreshMessage(message)) {
+          await debugLog("background_account_refresh_failed", { label, message })
+        }
+      }
+    }
+  })().finally(() => {
+    state.__anthropicBackgroundRefreshRunning = undefined
+  })
+
+  return state.__anthropicBackgroundRefreshRunning
+}
+
+function ensureBackgroundRefreshLoop(client: Parameters<typeof BaseAnthropicAuthPlugin>[0]["client"]) {
+  if (BACKGROUND_REFRESH_INTERVAL_MS <= 0) return
+
+  const state = backgroundState()
+  if (state.__anthropicBackgroundRefreshTimer) return
+
+  void refreshAllAccountsInBackground(client)
+
+  const timer = setInterval(() => {
+    void refreshAllAccountsInBackground(client)
+  }, BACKGROUND_REFRESH_INTERVAL_MS)
+
+  if (typeof timer.unref === "function") {
+    timer.unref()
+  }
+
+  state.__anthropicBackgroundRefreshTimer = timer
 }
 
 function cooldownUntil(account: StoredAccount) {
@@ -553,6 +789,9 @@ function cooldownUntil(account: StoredAccount) {
     if (Number.isFinite(timestamp)) {
       value = Math.max(value, timestamp + RATE_LIMIT_COOLDOWN_MS)
     }
+  }
+  if (!ENABLE_USAGE_POLLING) {
+    return value
   }
   if (usageValue(account.usage?.fiveHour) >= FIVE_HOUR_THRESHOLD) {
     value = Math.max(value, resetTimestamp(account.usage?.fiveHour))
@@ -575,6 +814,7 @@ function overThresholdReason(account: StoredAccount) {
 }
 
 function isAccountUsable(account: StoredAccount) {
+  if (account.usage?.refreshInvalid) return false
   if (account.usage?.tokenExpired) return false
   return cooldownUntil(account) <= Date.now()
 }
@@ -630,10 +870,6 @@ async function markRateLimited(store: AccountStore, label: string, errorText: st
     updatedAt: nowIso(),
   }))
 
-  try {
-    await refreshStoredUsage(store, label, true)
-  } catch {}
-
   await debugLog("account_rate_limited", {
     label,
     error: errorText,
@@ -652,6 +888,8 @@ async function selectNextHealthyAccount(store: AccountStore, currentLabel: strin
     })
 
   for (const label of labels) {
+    const current = store.accounts[label]
+    if (current?.usage?.refreshInvalid) continue
     try {
       let account = await refreshStoredAccount(store, label)
       account = await refreshStoredUsage(store, label)
@@ -719,11 +957,12 @@ async function switchToStoredAccount(label: string) {
 }
 
 function addCandidate(candidates: Candidate[], seen: Set<string>, code?: string | null, state?: string | null) {
-  if (!code || code === "true" || !state) return
-  const key = `${code}#${state}`
+  if (!code || code === "true") return
+  const normalizedState = state || undefined
+  const key = normalizedState ? `${code}#${normalizedState}` : code
   if (seen.has(key)) return
   seen.add(key)
-  candidates.push({ code, state })
+  candidates.push({ code, state: normalizedState })
 }
 
 function addUrlCandidates(candidates: Candidate[], seen: Set<string>, url: URL, verifier: string) {
@@ -754,7 +993,7 @@ function getCandidates(value: string, verifier: string) {
   if (input.includes("?") || input.includes("&")) {
     try {
       const params = new URLSearchParams(input.replace(/^[^?#]*[?#]/, ""))
-      addCandidate(candidates, seen, params.get("code"), params.get("state") ?? verifier)
+      addCandidate(candidates, seen, params.get("code"), params.get("state"))
     } catch {}
   }
 
@@ -766,7 +1005,7 @@ function getCandidates(value: string, verifier: string) {
     addCandidate(candidates, seen, right, left)
   }
 
-  addCandidate(candidates, seen, input, verifier)
+  addCandidate(candidates, seen, input, undefined)
   return candidates
 }
 
@@ -783,35 +1022,57 @@ function buildAuthUrl(authorizeUrl: string, scopes: string[], verifier: string, 
   return url.toString()
 }
 
-async function authorizeWithManualCode(value: string, verifier: string, redirectUri: string) {
-  const candidates = getCandidates(value, verifier)
+async function authorizeWithManualCode(value: string, attempt: PendingOAuthAttempt) {
+  const candidates = getCandidates(value, attempt.verifier)
+  const attempts = [
+    attempt,
+    ...(await listPendingOAuthAttempts({
+      purpose: attempt.purpose,
+      mode: "manual",
+      authorizeUrl: attempt.authorizeUrl,
+      redirectUri: attempt.redirectUri,
+    })).filter((item) => item.id !== attempt.id),
+  ]
   let lastError = ""
+  let attemptsTried = 0
 
   for (const [index, candidate] of candidates.entries()) {
-    try {
-      const tokens = await exchangeCode(candidate.code, candidate.state, verifier, redirectUri)
-      return {
-        type: "success" as const,
-        access: tokens.access,
-        refresh: tokens.refresh,
-        expires: tokens.expires,
+    for (const rankedAttempt of rankPendingAttempts(attempts, candidate, attempt)) {
+      if (candidate.state && candidate.state !== rankedAttempt.verifier) continue
+
+      attemptsTried += 1
+
+      try {
+        const state = candidate.state ?? rankedAttempt.verifier
+        const tokens = await exchangeCode(candidate.code, state, rankedAttempt.verifier, rankedAttempt.redirectUri)
+        await consumePendingOAuthAttempt(rankedAttempt.id)
+        return {
+          type: "success" as const,
+          access: tokens.access,
+          refresh: tokens.refresh,
+          expires: tokens.expires,
+          attempt: rankedAttempt,
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error)
+        await debugLog("manual_candidate_failed", {
+          redirectUri: rankedAttempt.redirectUri,
+          pendingAttemptID: rankedAttempt.id,
+          pendingAttemptPurpose: rankedAttempt.purpose,
+          pendingAttemptLabel: rankedAttempt.label,
+          index,
+          candidateCodeLength: candidate.code.length,
+          candidateStateLength: candidate.state?.length ?? 0,
+          lastError,
+        })
       }
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error)
-      await debugLog("manual_candidate_failed", {
-        redirectUri,
-        index,
-        candidateCodeLength: candidate.code.length,
-        candidateStateLength: candidate.state.length,
-        lastError,
-      })
     }
   }
 
   await debugLog("manual_exchange_failed", {
-    redirectUri,
+    redirectUri: attempt.redirectUri,
     inputLength: cleanInput(value).length,
-    candidatesTried: candidates.length,
+    candidatesTried: attemptsTried,
     lastError,
   })
 
@@ -985,6 +1246,17 @@ function createAddManualAccountMethod(label: string, authorizeUrl: string, scope
       const pkce = await generatePKCE()
       const url = buildAuthUrl(authorizeUrl, scopes, pkce.verifier, pkce.challenge, MANUAL_REDIRECT_URL)
       const opened = openBrowser(url)
+      const attempt = await registerPendingOAuthAttempt(
+        createPendingOAuthAttempt({
+          purpose: "account",
+          mode: "manual",
+          authorizeUrl,
+          redirectUri: MANUAL_REDIRECT_URL,
+          verifier: pkce.verifier,
+          label: accountLabel,
+          makeActive,
+        }),
+      )
 
       return {
         url,
@@ -993,9 +1265,9 @@ function createAddManualAccountMethod(label: string, authorizeUrl: string, scope
           : "Open the link, finish Anthropic login, then paste the final callback URL, the returned code#state value, or the raw Authentication Code here.",
         method: "code" as const,
         callback: async (value: string) => {
-          const result = await authorizeWithManualCode(value, pkce.verifier, MANUAL_REDIRECT_URL)
+          const result = await authorizeWithManualCode(value, attempt)
           if (result.type === "failed") return result
-          return finalizeLoggedInAccount(accountLabel, result, makeActive)
+          return finalizeLoggedInAccount(result.attempt.label ?? accountLabel, result, result.attempt.makeActive ?? makeActive)
         },
       }
     },
@@ -1235,6 +1507,7 @@ export async function AnthropicAuthPlugin(input: Parameters<typeof BaseAnthropic
   const initialStore = await ensureAccountStore()
   const switchMethods = sortedLabels(initialStore).map((label) => createSwitchAccountMethod(label))
   const baseLoader = hooks.auth.loader?.bind(hooks.auth)
+  ensureBackgroundRefreshLoop(input.client)
 
   return {
     ...hooks,
@@ -1257,6 +1530,19 @@ export async function AnthropicAuthPlugin(input: Parameters<typeof BaseAnthropic
                 if (!selection) return loaded.fetch(request, init)
 
                 selection.account = await refreshStoredAccount(selection.store, selection.label)
+                if (selection.account.usage?.refreshInvalid) {
+                  attempted.add(selection.label)
+                  const next = await selectNextHealthyAccount(selection.store, selection.label, attempted)
+                  if (next) {
+                    selection = await activateHealthyAccount(
+                      input.client,
+                      next.store,
+                      next.label,
+                      "Switch away from invalid refresh token",
+                    )
+                  }
+                }
+                if (!selection) return loaded.fetch(request, init)
                 if (Object.keys(selection.store.accounts).length > 1) {
                   selection.account = await refreshStoredUsage(selection.store, selection.label)
                   if (!isAccountUsable(selection.account)) {
@@ -1367,6 +1653,15 @@ export async function AnthropicAuthPlugin(input: Parameters<typeof BaseAnthropic
             const pkce = await generatePKCE()
             const url = buildAuthUrl(CONSOLE_AUTHORIZE_URL, CONSOLE_SCOPES, pkce.verifier, pkce.challenge, MANUAL_REDIRECT_URL)
             const opened = openBrowser(url)
+            const attempt = await registerPendingOAuthAttempt(
+              createPendingOAuthAttempt({
+                purpose: "api_key",
+                mode: "manual",
+                authorizeUrl: CONSOLE_AUTHORIZE_URL,
+                redirectUri: MANUAL_REDIRECT_URL,
+                verifier: pkce.verifier,
+              }),
+            )
 
             return {
               url,
@@ -1375,7 +1670,7 @@ export async function AnthropicAuthPlugin(input: Parameters<typeof BaseAnthropic
                 : "Open the link, finish Anthropic login, then paste the final callback URL, the returned code#state value, or the raw Authentication Code here.",
               method: "code" as const,
               callback: async (value: string) => {
-                const credentials = await authorizeWithManualCode(value, pkce.verifier, MANUAL_REDIRECT_URL)
+                const credentials = await authorizeWithManualCode(value, attempt)
                 if (credentials.type === "failed") return credentials
 
                 const response = await fetch(API_KEY_URL, {

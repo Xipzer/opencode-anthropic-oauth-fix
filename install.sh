@@ -34,8 +34,9 @@ if deps is None:
 if not isinstance(deps, dict):
     raise SystemExit(f"{package_json}: dependencies must be an object")
 
-deps["@opencode-ai/plugin"] = deps.get("@opencode-ai/plugin", "1.2.27")
+deps["@opencode-ai/plugin"] = deps.get("@opencode-ai/plugin", "1.4.0")
 deps["opencode-anthropic-auth"] = "0.0.13"
+deps["proper-lockfile"] = "4.1.2"
 data["dependencies"] = deps
 
 with open(package_json, "w", encoding="utf-8") as f:

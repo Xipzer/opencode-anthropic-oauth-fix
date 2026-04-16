@@ -29,6 +29,33 @@ bash ./install.sh
 
 Then restart OpenCode/Kimaki or start a fresh session.
 
+## Uninstall
+
+If you only want to remove this repo's local override and sidecar files while keeping the stock Anthropic plugin/config that was already present, run:
+
+```bash
+git clone https://github.com/Xipzer/opencode-anthropic-oauth-fix.git
+cd opencode-anthropic-oauth-fix
+chmod +x uninstall.sh
+bash ./uninstall.sh
+```
+
+This removes:
+
+- `~/.config/opencode/plugins/opencode-anthropic-auth.ts`
+- `~/.config/opencode/anthropic-accounts.json`
+- `~/.config/opencode/anthropic-pending-oauth.json`
+- `~/.config/opencode/anthropic-auth-debug.log`
+
+It does **not** remove:
+
+- `~/.config/opencode/opencode.json`
+- `~/.config/opencode/package.json`
+- the installed `opencode-anthropic-auth` dependency
+- `~/.local/share/opencode/auth.json`
+
+So uninstalling this repo's patch falls back to the stock upstream Anthropic plugin behavior after a restart or fresh session.
+
 If you ever see `/usr/bin/env: 'bash\r': Permission denied`, your checkout converted the script to CRLF line endings. Fix it once with:
 
 ```bash
@@ -50,10 +77,27 @@ The patch adds a local Anthropic account manager on top of OpenCode's normal sin
 
 - `anthropic-accounts.json` stores labeled saved OAuth accounts plus active-account state
 - the active account is mirrored back into OpenCode's canonical `auth.json`
+- if OpenCode's canonical Anthropic auth slot changes underneath the patch, the active saved account is reconciled against that live runtime state instead of silently drifting
 - manual auth attempts are tracked in `anthropic-pending-oauth.json` so stale/overwritten dialogs can still be redeemed safely
 - runtime requests use the active account and reactively fail over to another saved account on Anthropic `429` responses
 - saved accounts are refreshed periodically in the background so inactive accounts do not silently rot
-- accounts with invalid refresh tokens are quarantined instead of being retried forever
+- refresh operations are serialized with a lock so parallel sessions do not race and burn the same refresh-token family
+- OAuth token exchange/refresh calls run in an isolated Node child, matching Kimaki's hardened path
+- accounts with invalid refresh tokens are quarantined once their live access token is no longer usable, instead of being poisoned immediately
+
+## Root Cause Fixed
+
+The critical long-running failure mode was caused by three issues in the earlier multi-account patch layer:
+
+- refresh operations were not serialized across parallel sessions/processes
+- the background keepalive interval was longer than Anthropic's observed access-token lifetime
+- saved labeled accounts could drift from OpenCode's canonical live Anthropic auth slot
+
+The current architecture fixes those problems by:
+
+- locking refresh operations
+- refreshing well before token expiry
+- reconciling labeled saved accounts against the canonical runtime auth when possible
 
 ## Anthropic methods added
 
@@ -126,3 +170,4 @@ If auth fails again, inspect:
 
 - This installer is written for bash-compatible environments.
 - On Windows, use Git Bash, WSL, or another POSIX-compatible shell.
+- The uninstall script removes only this repo's local override layer, not the stock Anthropic plugin or existing canonical auth state.

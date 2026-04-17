@@ -18,18 +18,18 @@ rm -f \
   "$CONFIG_DIR/anthropic-auth-debug.log"
 
 echo
-echo "Local Anthropic override removed."
+echo "Local Anthropic multi-account extension removed."
 echo "Config dir: $CONFIG_DIR"
 echo
 echo "Removed:"
-echo "  - local override plugin"
-echo "  - local Anthropic sidecar state"
+echo "  - local Anthropic wrapper plugin"
+echo "  - saved Anthropic account metadata"
+echo "  - legacy Anthropic sidecar files from earlier versions"
 echo
 echo "Kept intact:"
-echo "  - stock opencode-anthropic-auth dependency"
-echo "  - plugin registration in opencode.json"
+echo "  - kimaki package dependency in package.json"
 echo "  - canonical auth.json"
 echo
 echo "Next steps:"
 echo "1. Restart OpenCode/Kimaki or start a fresh session."
-echo "2. Anthropic will fall back to the stock upstream plugin behavior."
+echo "2. In Kimaki, Anthropic will fall back to Kimaki's built-in plugin behavior."

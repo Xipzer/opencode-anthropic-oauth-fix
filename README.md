@@ -27,7 +27,7 @@ Then restart OpenCode/Kimaki or start a fresh session.
 
 ## Uninstall
 
-If you only want to remove this repo's local override and sidecar files while keeping the stock Anthropic plugin/config that was already present, run:
+If you only want to remove this repo's local multi-account wrapper and saved-account sidecar files while keeping Kimaki's built-in Anthropic behavior, run:
 
 ```bash
 git clone https://github.com/Xipzer/opencode-anthropic-oauth-fix.git
@@ -43,14 +43,15 @@ This removes:
 - `~/.config/opencode/anthropic-pending-oauth.json`
 - `~/.config/opencode/anthropic-auth-debug.log`
 
+The last two are legacy cleanup from the older standalone implementation.
+
 It does **not** remove:
 
-- `~/.config/opencode/opencode.json`
 - `~/.config/opencode/package.json`
-- the installed `opencode-anthropic-auth` dependency
 - `~/.local/share/opencode/auth.json`
+- the installed `kimaki` dependency used by the thin wrapper
 
-So uninstalling this repo's patch falls back to the stock upstream Anthropic plugin behavior after a restart or fresh session.
+So uninstalling this repo's patch falls back to Kimaki's built-in Anthropic plugin behavior after a restart or fresh session.
 
 If you ever see `/usr/bin/env: 'bash\r': Permission denied`, your checkout converted the script to CRLF line endings. Fix it once with:
 
@@ -64,6 +65,8 @@ bash ./install.sh
 - `~/.config/opencode/package.json`
 - `~/.config/opencode/plugins/opencode-anthropic-auth.ts`
 - `~/.config/opencode/anthropic-accounts.json` (created after you save accounts)
+
+The installer does not need to rewrite `opencode.json` in the thin-wrapper design.
 
 ## Architecture
 
@@ -80,6 +83,8 @@ The extension adds a saved-account layer on top of Kimaki's canonical Anthropic 
   - `Use saved Anthropic account`
   - reactive failover between saved accounts
 - the canonical OpenCode `auth.json` slot remains the live active credential
+
+That means this repo is an extension layer, not a replacement auth provider.
 
 ## Root Cause Fixed
 
@@ -149,4 +154,4 @@ If auth fails again, inspect:
 
 - This installer is written for bash-compatible environments.
 - On Windows, use Git Bash, WSL, or another POSIX-compatible shell.
-- The uninstall script removes only this repo's local override layer, not Kimaki's built-in Anthropic plugin or existing canonical auth state.
+- The uninstall script removes only this repo's local extension layer, not Kimaki's built-in Anthropic plugin or existing canonical auth state.

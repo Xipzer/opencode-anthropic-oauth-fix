@@ -1,96 +1,38 @@
-import { spawn } from "node:child_process"
-import { once } from "node:events"
-import * as fs from "node:fs/promises"
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
-import { createServer } from "node:http"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
-import { generatePKCE } from "@openauthjs/openauth/pkce"
-import { AnthropicAuthPlugin as BaseAnthropicAuthPlugin } from "opencode-anthropic-auth"
-import lockfile from "proper-lockfile"
+import type { Plugin } from "@opencode-ai/plugin"
+import { anthropicAuthPlugin as builtInAnthropicAuthPlugin } from "kimaki/src/anthropic-auth-plugin.ts"
 
 const HOME = process.env.HOME ?? ""
 const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME ?? path.join(HOME, ".config"), "opencode")
 const DATA_DIR = path.join(process.env.XDG_DATA_HOME ?? path.join(HOME, ".local", "share"), "opencode")
 const AUTH_FILE = path.join(DATA_DIR, "auth.json")
 const ACCOUNTS_FILE = path.join(CONFIG_DIR, "anthropic-accounts.json")
-const PENDING_OAUTH_FILE = path.join(CONFIG_DIR, "anthropic-pending-oauth.json")
-
-const CLIENT_ID = process.env.ANTHROPIC_CLIENT_ID || "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-const CLAUDE_AI_AUTHORIZE_URL = process.env.ANTHROPIC_AUTHORIZE_URL || "https://claude.ai/oauth/authorize"
-const CONSOLE_AUTHORIZE_URL = process.env.ANTHROPIC_CONSOLE_AUTHORIZE_URL || "https://platform.claude.com/oauth/authorize"
-const TOKEN_URL = process.env.ANTHROPIC_TOKEN_URL || "https://platform.claude.com/v1/oauth/token"
-const USAGE_API_URL = process.env.ANTHROPIC_USAGE_API_URL || "https://api.anthropic.com/api/oauth/usage"
-const API_KEY_URL = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key"
-const MANUAL_REDIRECT_URL = process.env.ANTHROPIC_REDIRECT_URI || "https://platform.claude.com/oauth/code/callback"
-const SUCCESS_URL = "https://platform.claude.com/oauth/code/success?app=claude-code"
-const LOCALHOST = "localhost"
-const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000
-const DEBUG_LOG = path.join(CONFIG_DIR, "anthropic-auth-debug.log")
-const TOKEN_EXPIRY_SKEW_MS = 5 * 60 * 1000
-const CLAUDE_CODE_SYSTEM_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude."
-const CLAUDE_CODE_BETA_HEADERS =
-  process.env.ANTHROPIC_BETA_FLAGS ||
-  "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
-const CLAUDE_CLI_VERSION = process.env.ANTHROPIC_CLI_VERSION || "2.1.80"
-const CLAUDE_CODE_USER_AGENT = process.env.ANTHROPIC_USER_AGENT || `claude-cli/${CLAUDE_CLI_VERSION} (external, cli)`
-const MCP_TOOL_PREFIX = "mcp_"
-const CLAUDE_AI_SCOPES = (
-  process.env.ANTHROPIC_SCOPES ||
-  "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
-)
-  .split(/\s+/)
-  .filter(Boolean)
-const CONSOLE_SCOPES = (process.env.ANTHROPIC_CONSOLE_SCOPES || "org:create_api_key user:profile")
-  .split(/\s+/)
-  .filter(Boolean)
 const DEFAULT_IMPORTED_LABEL = process.env.ANTHROPIC_DEFAULT_ACCOUNT_LABEL || "default"
-const ACCOUNT_STRATEGY = process.env.ANTHROPIC_ACCOUNT_STRATEGY === "drain" ? "drain" : "balanced"
-const ENABLE_USAGE_POLLING = process.env.ANTHROPIC_ENABLE_USAGE_POLLING === "1"
-const BACKGROUND_REFRESH_INTERVAL_MS = numberEnv("ANTHROPIC_BACKGROUND_REFRESH_INTERVAL_MS", 60 * 60 * 1000)
-const BACKGROUND_REFRESH_EXPIRY_MARGIN_MS = numberEnv("ANTHROPIC_BACKGROUND_REFRESH_EXPIRY_MARGIN_MS", 2 * 60 * 60 * 1000)
-const FIVE_HOUR_THRESHOLD = numberEnv("ANTHROPIC_FIVE_HOUR_THRESHOLD", 100)
-const SEVEN_DAY_THRESHOLD = numberEnv("ANTHROPIC_SEVEN_DAY_THRESHOLD", 100)
-const USAGE_CACHE_TTL_MS = numberEnv("ANTHROPIC_USAGE_CACHE_TTL_MS", 60_000)
-const RATE_LIMIT_COOLDOWN_MS = numberEnv("ANTHROPIC_RATE_LIMIT_COOLDOWN_MS", 15 * 60_000)
-const USAGE_RATE_LIMIT_BACKOFF_MS = numberEnv("ANTHROPIC_USAGE_RATE_LIMIT_BACKOFF_MS", 10 * 60_000)
-const PENDING_ATTEMPT_TTL_MS = numberEnv("ANTHROPIC_PENDING_ATTEMPT_TTL_MS", 30 * 60_000)
+const RATE_LIMIT_COOLDOWN_MS = Number(process.env.ANTHROPIC_RATE_LIMIT_COOLDOWN_MS) || 15 * 60 * 1000
 
-type Candidate = {
-  code: string
-  state?: string
+type OAuthStored = {
+  type: "oauth"
+  refresh: string
+  access: string
+  expires: number
 }
 
 type OAuthSuccess = {
   type: "success"
-  access: string
+  provider?: string
   refresh: string
+  access: string
   expires: number
-}
-
-type AccountUsageWindow = {
-  utilization: number
-  resetsAt?: string
-}
-
-type AccountUsage = {
-  fiveHour?: AccountUsageWindow
-  sevenDay?: AccountUsageWindow
-  sevenDaySonnet?: AccountUsageWindow
-  sevenDayOpus?: AccountUsageWindow
-  polledAt?: string
-  backoffUntil?: string
-  tokenExpired?: boolean
-  refreshInvalid?: boolean
 }
 
 type StoredAccount = {
   label: string
-  access: string
   refresh: string
+  access: string
   expires: number
   addedAt: string
   updatedAt: string
-  usage?: AccountUsage
   lastRateLimitAt?: string
 }
 
@@ -110,60 +52,8 @@ type AccountStore = {
   history: AccountHistoryEntry[]
 }
 
-type PendingOAuthAttempt = {
-  id: string
-  purpose: "account" | "api_key"
-  mode: "manual" | "auto"
-  authorizeUrl: string
-  redirectUri: string
-  verifier: string
-  createdAt: string
-  label?: string
-  makeActive?: boolean
-}
-
-type PendingOAuthStore = {
-  version: 1
-  attempts: PendingOAuthAttempt[]
-}
-
-type PreparedRequest = {
-  original: RequestInfo | URL
-  finalUrl: string | null
-  requestInit: RequestInit
-  headers: Headers
-  body: BodyInit | undefined
-}
-
-type ActiveSelection = {
-  store: AccountStore
-  label: string
-  account: StoredAccount
-}
-
-type AnthropicBackgroundState = typeof globalThis & {
-  __anthropicBackgroundRefreshRunning?: Promise<void>
-  __anthropicBackgroundRefreshTimer?: ReturnType<typeof setInterval>
-  __anthropicPendingRefreshes?: Map<string, Promise<StoredAccount>>
-}
-
-function numberEnv(name: string, fallback: number) {
-  const value = Number(process.env[name])
-  return Number.isFinite(value) ? value : fallback
-}
-
 function nowIso() {
   return new Date().toISOString()
-}
-
-function updatedTimestamp(value?: string) {
-  if (!value) return 0
-  const timestamp = Date.parse(value)
-  return Number.isFinite(timestamp) ? timestamp : 0
-}
-
-function cleanInput(value: string) {
-  return value.trim().replace(/\s+/g, "")
 }
 
 function sanitizeLabel(value: string) {
@@ -186,34 +76,35 @@ function emptyStore(): AccountStore {
   }
 }
 
-function emptyPendingOAuthStore(): PendingOAuthStore {
+function toOAuthBody(account: StoredAccount) {
   return {
-    version: 1,
-    attempts: [],
+    type: "oauth" as const,
+    refresh: account.refresh,
+    access: account.access,
+    expires: account.expires,
   }
 }
 
 function toOAuthSuccess(account: StoredAccount): OAuthSuccess {
   return {
     type: "success",
-    access: account.access,
     refresh: account.refresh,
+    access: account.access,
     expires: account.expires,
   }
 }
 
-function toOAuthBody(account: StoredAccount) {
+function buildStoredAccount(label: string, auth: { refresh: string; access: string; expires: number }, previous?: StoredAccount): StoredAccount {
+  const now = nowIso()
   return {
-    type: "oauth" as const,
-    access: account.access,
-    refresh: account.refresh,
-    expires: account.expires,
+    label,
+    refresh: auth.refresh,
+    access: auth.access,
+    expires: auth.expires,
+    addedAt: previous?.addedAt ?? now,
+    updatedAt: now,
+    lastRateLimitAt: previous?.lastRateLimitAt,
   }
-}
-
-function normalizeHistory(history: unknown): AccountHistoryEntry[] {
-  if (!Array.isArray(history)) return []
-  return history.filter((entry): entry is AccountHistoryEntry => Boolean(entry && typeof entry === "object")).slice(-50)
 }
 
 function normalizeStore(store: Partial<AccountStore> | undefined): AccountStore {
@@ -221,56 +112,8 @@ function normalizeStore(store: Partial<AccountStore> | undefined): AccountStore 
     version: 1,
     active: typeof store?.active === "string" ? store.active : undefined,
     accounts: store?.accounts && typeof store.accounts === "object" ? store.accounts : {},
-    history: normalizeHistory(store?.history),
+    history: Array.isArray(store?.history) ? store.history.filter(Boolean).slice(-50) as AccountHistoryEntry[] : [],
   }
-}
-
-function normalizePendingOAuthStore(store: Partial<PendingOAuthStore> | undefined): PendingOAuthStore {
-  const attempts = Array.isArray(store?.attempts)
-    ? store.attempts.filter((attempt): attempt is PendingOAuthAttempt => Boolean(attempt && typeof attempt === "object"))
-    : []
-
-  return {
-    version: 1,
-    attempts,
-  }
-}
-
-async function debugLog(event: string, data: Record<string, unknown>) {
-  const payload = {
-    time: nowIso(),
-    event,
-    ...data,
-  }
-
-  if (shouldConsoleLog(event, data)) {
-    console.error(`[anthropic-auth] ${event}`, payload)
-  }
-  try {
-    await mkdir(path.dirname(DEBUG_LOG), { recursive: true })
-    await appendFile(DEBUG_LOG, `${JSON.stringify(payload)}\n`)
-  } catch {}
-}
-
-function isRateLimitMessage(message: string) {
-  return /rate_limit_error|Rate limited/i.test(message)
-}
-
-function isInvalidRefreshMessage(message: string) {
-  return /invalid_grant|Refresh token not found or invalid/i.test(message)
-}
-
-function shouldConsoleLog(event: string, data: Record<string, unknown>) {
-  if (event === "token_retry_scheduled" && data.url === USAGE_API_URL) return false
-  if (
-    event === "usage_fetch_failed" &&
-    typeof data.message === "string" &&
-    isRateLimitMessage(data.message) &&
-    data.tokenExpired === false
-  ) {
-    return false
-  }
-  return true
 }
 
 async function readJson<T>(filePath: string, fallback: T): Promise<T> {
@@ -287,160 +130,20 @@ async function writeJson(filePath: string, value: unknown) {
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8")
 }
 
-async function requestText(
-  urlString: string,
-  options: {
-    method: string
-    headers?: Record<string, string>
-    body?: string
-  },
-) {
-  return new Promise<string>((resolve, reject) => {
-    const payload = JSON.stringify({
-      body: options.body,
-      headers: options.headers,
-      method: options.method,
-      url: urlString,
-    })
-
-    const child = spawn(
-      "node",
-      [
-        "-e",
-        `const input = JSON.parse(process.argv[1]); (async () => { const response = await fetch(input.url, { method: input.method, headers: input.headers, body: input.body }); const text = await response.text(); if (!response.ok) { console.error(JSON.stringify({ status: response.status, body: text })); process.exit(1); } process.stdout.write(text); })().catch((error) => { console.error(error instanceof Error ? error.stack ?? error.message : String(error)); process.exit(1); });`,
-        payload,
-      ],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    )
-
-    let stdout = ""
-    let stderr = ""
-    const timeout = setTimeout(() => {
-      child.kill()
-      reject(new Error(`Request timed out. url=${urlString}`))
-    }, 30_000)
-
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk)
-    })
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk)
-    })
-
-    child.on("error", (error) => {
-      clearTimeout(timeout)
-      reject(error)
-    })
-
-    child.on("close", (code) => {
-      clearTimeout(timeout)
-      if (code !== 0) {
-        let details = stderr.trim()
-        try {
-          const parsed = JSON.parse(details) as { status?: number; body?: string }
-          if (typeof parsed.status === "number") {
-            reject(new Error(`HTTP ${parsed.status} from ${urlString}: ${parsed.body ?? ""}`))
-            return
-          }
-        } catch {
-          // fall through to raw stderr
-        }
-        reject(new Error(details || `Node helper exited with code ${code}`))
-        return
-      }
-      resolve(stdout)
-    })
-  })
+async function loadCanonicalAnthropicAuth() {
+  const data = await readJson<Record<string, unknown>>(AUTH_FILE, {})
+  const auth = data?.anthropic as Partial<OAuthStored> | undefined
+  if (!auth || auth.type !== "oauth") return
+  if (typeof auth.refresh !== "string" || typeof auth.access !== "string" || typeof auth.expires !== "number") return
+  return auth as OAuthStored
 }
 
-async function postJson(url: string, body: Record<string, string | number>) {
-  const requestBody = JSON.stringify(body)
-  const responseText = await requestText(url, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Length": String(Buffer.byteLength(requestBody)),
-      "Content-Type": "application/json",
-      "User-Agent": CLAUDE_CODE_USER_AGENT,
-    },
-    body: requestBody,
-  })
-  return JSON.parse(responseText) as unknown
+async function loadAccountStore() {
+  return normalizeStore(await readJson<Partial<AccountStore>>(ACCOUNTS_FILE, emptyStore()))
 }
 
-function parseTokenResponse(json: unknown): { access_token: string; refresh_token: string; expires_in: number } {
-  const data = json as { access_token: string; refresh_token: string; expires_in: number }
-  if (!data.access_token || !data.refresh_token || !data.expires_in) {
-    throw new Error(`Invalid token response: ${JSON.stringify(json)}`)
-  }
-  return data
-}
-
-function tokenExpiry(expiresIn: number) {
-  return Date.now() + expiresIn * 1000 - TOKEN_EXPIRY_SKEW_MS
-}
-
-async function withAccountRefreshLock<T>(fn: () => Promise<T>) {
-  const file = AUTH_FILE
-  await mkdir(path.dirname(file), { recursive: true })
-  await fs.appendFile(file, "")
-
-  const release = await lockfile.lock(file, {
-    realpath: false,
-    stale: 30_000,
-    update: 15_000,
-    retries: { factor: 1.3, forever: true, maxTimeout: 1_000, minTimeout: 100 },
-    onCompromised: () => {},
-  })
-
-  try {
-    return await fn()
-  } finally {
-    await release().catch(() => {})
-  }
-}
-
-function usageWindow(input: any): AccountUsageWindow | undefined {
-  if (!input || typeof input !== "object") return undefined
-  const utilization = Number(input.utilization)
-  if (!Number.isFinite(utilization)) return undefined
-  const resetsAt = typeof input.resets_at === "string" ? input.resets_at : undefined
-  return { utilization, resetsAt }
-}
-
-function parseUsage(input: any): AccountUsage {
-  return {
-    fiveHour: usageWindow(input?.five_hour),
-    sevenDay: usageWindow(input?.seven_day),
-    sevenDaySonnet: usageWindow(input?.seven_day_sonnet),
-    sevenDayOpus: usageWindow(input?.seven_day_opus),
-    polledAt: nowIso(),
-    tokenExpired: false,
-  }
-}
-
-function usageValue(window?: AccountUsageWindow) {
-  return window?.utilization ?? 0
-}
-
-function usageTimestamp(usage?: AccountUsage) {
-  if (!usage?.polledAt) return 0
-  const value = Date.parse(usage.polledAt)
-  return Number.isFinite(value) ? value : 0
-}
-
-function usageBackoffTimestamp(usage?: AccountUsage) {
-  if (!usage?.backoffUntil) return 0
-  const value = Date.parse(usage.backoffUntil)
-  return Number.isFinite(value) ? value : 0
-}
-
-function resetTimestamp(window?: AccountUsageWindow) {
-  if (!window?.resetsAt) return 0
-  const value = Date.parse(window.resetsAt)
-  return Number.isFinite(value) ? value : 0
+async function saveAccountStore(store: AccountStore) {
+  await writeJson(ACCOUNTS_FILE, store)
 }
 
 function addHistory(store: AccountStore, entry: AccountHistoryEntry) {
@@ -455,144 +158,45 @@ function sortedLabels(store: AccountStore) {
   })
 }
 
-function buildStoredAccount(label: string, auth: { access: string; refresh: string; expires: number }, previous?: StoredAccount): StoredAccount {
-  const now = nowIso()
-  const usage = previous?.usage
-  return {
-    label,
-    access: auth.access,
-    refresh: auth.refresh,
-    expires: auth.expires,
-    addedAt: previous?.addedAt ?? now,
-    updatedAt: now,
-    usage: usage
-      ? {
-          ...usage,
-          refreshInvalid: false,
-          tokenExpired: false,
-        }
-      : undefined,
-    lastRateLimitAt: previous?.lastRateLimitAt,
-  }
-}
-
-async function loadCanonicalAnthropicAuth() {
-  const data = await readJson<Record<string, any>>(AUTH_FILE, {})
-  const auth = data?.anthropic
-  if (!auth || auth.type !== "oauth") return
-  if (typeof auth.access !== "string" || typeof auth.refresh !== "string" || typeof auth.expires !== "number") return
-  return {
-    access: auth.access,
-    refresh: auth.refresh,
-    expires: auth.expires,
-  }
-}
-
-async function loadAccountStore() {
-  return normalizeStore(await readJson<Partial<AccountStore>>(ACCOUNTS_FILE, emptyStore()))
-}
-
-async function saveAccountStore(store: AccountStore) {
-  await writeJson(ACCOUNTS_FILE, store)
-}
-
-async function loadPendingOAuthStore() {
-  return normalizePendingOAuthStore(await readJson<Partial<PendingOAuthStore>>(PENDING_OAUTH_FILE, emptyPendingOAuthStore()))
-}
-
-async function savePendingOAuthStore(store: PendingOAuthStore) {
-  await writeJson(PENDING_OAUTH_FILE, store)
-}
-
-function isPendingAttemptFresh(attempt: PendingOAuthAttempt) {
-  const created = Date.parse(attempt.createdAt)
-  if (!Number.isFinite(created)) return false
-  return created > Date.now() - PENDING_ATTEMPT_TTL_MS
-}
-
-async function cleanupPendingOAuthAttempts() {
-  const store = await loadPendingOAuthStore()
-  const attempts = store.attempts.filter(isPendingAttemptFresh)
-  if (attempts.length !== store.attempts.length) {
-    store.attempts = attempts
-    await savePendingOAuthStore(store)
-  }
-  return store
-}
-
-async function registerPendingOAuthAttempt(attempt: PendingOAuthAttempt) {
-  const store = await cleanupPendingOAuthAttempts()
-  store.attempts = [...store.attempts.filter((item) => item.id !== attempt.id), attempt]
-  await savePendingOAuthStore(store)
-  return attempt
-}
-
-async function consumePendingOAuthAttempt(id: string) {
-  const store = await cleanupPendingOAuthAttempts()
-  const before = store.attempts.length
-  store.attempts = store.attempts.filter((attempt) => attempt.id !== id)
-  if (store.attempts.length !== before) {
-    await savePendingOAuthStore(store)
-  }
-}
-
-async function listPendingOAuthAttempts(filter: Partial<Pick<PendingOAuthAttempt, "purpose" | "mode" | "authorizeUrl" | "redirectUri">>) {
-  const store = await cleanupPendingOAuthAttempts()
-  return store.attempts.filter((attempt) => {
-    if (filter.purpose && attempt.purpose !== filter.purpose) return false
-    if (filter.mode && attempt.mode !== filter.mode) return false
-    if (filter.authorizeUrl && attempt.authorizeUrl !== filter.authorizeUrl) return false
-    if (filter.redirectUri && attempt.redirectUri !== filter.redirectUri) return false
-    return true
-  })
-}
-
-function createPendingOAuthAttempt(input: Omit<PendingOAuthAttempt, "id" | "createdAt">): PendingOAuthAttempt {
-  return {
-    id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
-    createdAt: nowIso(),
-    ...input,
-  }
-}
-
-function rankPendingAttempts(
-  attempts: PendingOAuthAttempt[],
-  candidate: Candidate,
-  fallbackAttempt: PendingOAuthAttempt,
-) {
-  return [...attempts].sort((left, right) => {
-    const score = (attempt: PendingOAuthAttempt) => {
-      let value = 0
-      if (candidate.state && attempt.verifier === candidate.state) value += 100
-      if (attempt.id === fallbackAttempt.id) value += 10
-      return value
-    }
-
-    const leftScore = score(left)
-    const rightScore = score(right)
-    if (leftScore !== rightScore) return rightScore - leftScore
-    return Date.parse(right.createdAt) - Date.parse(left.createdAt)
+function labelForAuth(store: AccountStore, auth: { refresh: string; access: string }) {
+  return sortedLabels(store).find((label) => {
+    const account = store.accounts[label]
+    if (!account) return false
+    return account.refresh === auth.refresh || account.access === auth.access
   })
 }
 
 async function ensureAccountStore() {
   const store = await loadAccountStore()
   let changed = false
+  const canonical = await loadCanonicalAnthropicAuth()
 
-  if (Object.keys(store.accounts).length === 0) {
-    const legacy = await loadCanonicalAnthropicAuth()
-    if (legacy) {
+  if (canonical) {
+    const matched = labelForAuth(store, canonical)
+    if (matched) {
+      const current = store.accounts[matched]
+      if (
+        current &&
+        (current.refresh !== canonical.refresh || current.access !== canonical.access || current.expires !== canonical.expires)
+      ) {
+        store.accounts[matched] = buildStoredAccount(matched, canonical, current)
+        changed = true
+      }
+      if (store.active !== matched) {
+        store.active = matched
+        changed = true
+      }
+    } else if (Object.keys(store.accounts).length === 0) {
       const label = sanitizeLabel(DEFAULT_IMPORTED_LABEL) || "default"
-      store.accounts[label] = buildStoredAccount(label, legacy)
+      store.accounts[label] = buildStoredAccount(label, canonical)
       store.active = label
       addHistory(store, {
         at: nowIso(),
         action: "import",
         label,
-        reason: "Imported existing anthropic auth.json credentials",
+        reason: "Imported existing canonical Anthropic auth",
       })
       changed = true
-      await debugLog("legacy_account_imported", { label })
     }
   }
 
@@ -621,1021 +225,49 @@ async function setActiveLabel(store: AccountStore, label: string, reason: string
   await saveAccountStore(store)
 }
 
-async function saveLabeledAccount(label: string, auth: { access: string; refresh: string; expires: number }, options?: { activate?: boolean; reason?: string }) {
-  const store = await ensureAccountStore()
+async function upsertAccount(store: AccountStore, label: string, auth: { refresh: string; access: string; expires: number }, reason: string) {
   const key = sanitizeLabel(label)
   if (!key) throw new Error("Missing account label")
-
   const existed = Boolean(store.accounts[key])
   store.accounts[key] = buildStoredAccount(key, auth, store.accounts[key])
   addHistory(store, {
     at: nowIso(),
     action: existed ? "upsert" : "add",
     label: key,
-    reason: options?.reason,
+    reason,
   })
-
-  if (options?.activate || !store.active || !store.accounts[store.active]) {
-    store.active = key
-  }
-
   await saveAccountStore(store)
-  return {
-    store,
-    label: key,
-    account: store.accounts[key],
-  }
+  return { label: key, account: store.accounts[key] }
 }
 
-async function updateStoredAccount(store: AccountStore, label: string, updater: (account: StoredAccount) => StoredAccount) {
-  const current = store.accounts[label]
-  if (!current) throw new Error(`Unknown Anthropic account: ${label}`)
-  store.accounts[label] = updater(current)
-  await saveAccountStore(store)
-  return store.accounts[label]
-}
-
-async function setCanonicalAuth(client: Parameters<typeof BaseAnthropicAuthPlugin>[0]["client"], account: StoredAccount) {
-  await client.auth.set({
-    path: {
-      id: "anthropic",
-    },
-    body: toOAuthBody(account),
-  })
-}
-
-async function syncStoredAccountFromCanonical(store: AccountStore, label: string, auth: { access: string; refresh: string; expires: number }) {
-  const current = store.accounts[label]
-  if (!current) return buildStoredAccount(label, auth)
-  if (current.access === auth.access && current.refresh === auth.refresh && current.expires === auth.expires) {
-    return current
-  }
-
-  return await updateStoredAccount(store, label, (previous) => buildStoredAccount(label, auth, previous))
-}
-
-async function fetchWithRetry(url: string, init: RequestInit, retries = 3) {
-  let lastResponse: Response | undefined
-
-  for (let attempt = 0; attempt < retries; attempt += 1) {
-    const response = await fetch(url, init)
-    if (response.status !== 429 || attempt === retries - 1) return response
-
-    lastResponse = response
-    await debugLog("token_retry_scheduled", {
-      url,
-      status: response.status,
-      attempt: attempt + 1,
-      retries,
-    })
-    await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 2000))
-  }
-
-  return lastResponse ?? fetch(url, init)
-}
-
-async function exchangeCode(code: string, state: string, verifier: string, redirectUri: string) {
-  let json: unknown
-  try {
-    json = await postJson(TOKEN_URL, {
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: redirectUri,
-      client_id: CLIENT_ID,
-      code_verifier: verifier,
-      state,
-    })
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    await debugLog("token_exchange_failed", {
-      redirectUri,
-      codeLength: code.length,
-      stateLength: state.length,
-      error: message,
-    })
-    throw error
-  }
-
-  const data = parseTokenResponse(json)
-
-  return {
-    access: data.access_token,
-    refresh: data.refresh_token,
-    expires: tokenExpiry(data.expires_in),
-  }
-}
-
-async function refreshTokens(refreshToken: string) {
-  const json = await postJson(TOKEN_URL, {
-    grant_type: "refresh_token",
-    refresh_token: refreshToken,
-    client_id: CLIENT_ID,
-  })
-
-  return parseTokenResponse(json)
-}
-
-async function fetchUsage(accessToken: string) {
-  const response = await fetchWithRetry(USAGE_API_URL, {
-    method: "GET",
-    headers: {
-      authorization: `Bearer ${accessToken}`,
-      "anthropic-beta": "oauth-2025-04-20",
-      "user-agent": CLAUDE_CODE_USER_AGENT,
-    },
-  })
-
-  const text = await response.text().catch(() => "")
-  if (!response.ok) {
-    throw new Error(text || `Usage request failed: ${response.status}`)
-  }
-
-  return parseUsage(text ? JSON.parse(text) : {})
-}
-
-async function refreshStoredAccount(
-  store: AccountStore,
-  label: string,
-  client: Parameters<typeof BaseAnthropicAuthPlugin>[0]["client"],
-  force = false,
-) {
-  const account = store.accounts[label]
-  if (!account) throw new Error(`Unknown Anthropic account: ${label}`)
-  if (!force && account.access && account.expires > Date.now() + TOKEN_EXPIRY_SKEW_MS) {
-    return account
-  }
-  if (!force && account.usage?.refreshInvalid && account.expires <= Date.now() + TOKEN_EXPIRY_SKEW_MS) {
-    return account
-  }
-
-  const state = backgroundState()
-  state.__anthropicPendingRefreshes ??= new Map()
-  const pending = state.__anthropicPendingRefreshes.get(label)
-  if (pending) return pending
-
-  const refreshPromise = withAccountRefreshLock(async () => {
-    const latestStore = await ensureAccountStore()
-    const latest = latestStore.accounts[label]
-    if (!latest) throw new Error(`Unknown Anthropic account: ${label}`)
-
-    if (!force && latest.access && latest.expires > Date.now() + TOKEN_EXPIRY_SKEW_MS) {
-      store.accounts[label] = latest
-      return latest
-    }
-    if (!force && latest.usage?.refreshInvalid && latest.expires <= Date.now() + TOKEN_EXPIRY_SKEW_MS) {
-      store.accounts[label] = latest
-      return latest
-    }
-
-    try {
-      const refreshed = await refreshTokens(latest.refresh)
-      const saved = await updateStoredAccount(latestStore, label, (current) => ({
-        ...current,
-        access: refreshed.access_token,
-        refresh: refreshed.refresh_token,
-        expires: tokenExpiry(refreshed.expires_in),
-        updatedAt: nowIso(),
-        usage: {
-          ...current.usage,
-          refreshInvalid: false,
-          tokenExpired: false,
-        },
-      }))
-      store.accounts[label] = saved
-      if (latestStore.active === label) {
-        await setCanonicalAuth(client, saved)
-      }
-      return saved
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      const refreshInvalid = isInvalidRefreshMessage(message)
-      await debugLog("account_refresh_failed", { label, message })
-      const saved = await updateStoredAccount(latestStore, label, (current) => ({
-        ...current,
-        usage: {
-          ...current.usage,
-          refreshInvalid: refreshInvalid || current.usage?.refreshInvalid,
-          tokenExpired: current.expires <= Date.now() + TOKEN_EXPIRY_SKEW_MS,
-          polledAt: nowIso(),
-        },
-      }))
-      store.accounts[label] = saved
-      throw error
-    }
-  }).finally(() => {
-    state.__anthropicPendingRefreshes?.delete(label)
-  })
-
-  state.__anthropicPendingRefreshes.set(label, refreshPromise)
-  return refreshPromise
-}
-
-async function refreshStoredUsage(store: AccountStore, label: string, force = false) {
-  const account = store.accounts[label]
-  if (!account) throw new Error(`Unknown Anthropic account: ${label}`)
-  if (!ENABLE_USAGE_POLLING) {
-    return account
-  }
-  if (!force && usageTimestamp(account.usage) > Date.now() - USAGE_CACHE_TTL_MS) {
-    return account
-  }
-  if (!force && usageBackoffTimestamp(account.usage) > Date.now()) {
-    return account
-  }
-
-  try {
-    const usage = await fetchUsage(account.access)
-    return await updateStoredAccount(store, label, (current) => ({
-      ...current,
-      usage,
-      updatedAt: nowIso(),
-    }))
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    const tokenExpired = /token_expired|OAuth token has expired|authentication_error/i.test(message)
-    const rateLimited = isRateLimitMessage(message)
-    await debugLog("usage_fetch_failed", { label, message, tokenExpired, rateLimited })
-    return await updateStoredAccount(store, label, (current) => ({
-      ...current,
-      usage: {
-        ...current.usage,
-        polledAt: nowIso(),
-        backoffUntil: rateLimited ? new Date(Date.now() + USAGE_RATE_LIMIT_BACKOFF_MS).toISOString() : current.usage?.backoffUntil,
-        tokenExpired: tokenExpired || current.usage?.tokenExpired,
-      },
-    }))
-  }
-}
-
-function shouldBackgroundRefreshAccount(account: StoredAccount) {
-  if (account.usage?.refreshInvalid) return false
-  if (account.expires <= Date.now() + BACKGROUND_REFRESH_EXPIRY_MARGIN_MS) return true
-  return updatedTimestamp(account.updatedAt) <= Date.now() - BACKGROUND_REFRESH_INTERVAL_MS
-}
-
-function backgroundState() {
-  return globalThis as AnthropicBackgroundState
-}
-
-async function refreshAllAccountsInBackground(client: Parameters<typeof BaseAnthropicAuthPlugin>[0]["client"]) {
-  const state = backgroundState()
-  if (state.__anthropicBackgroundRefreshRunning) {
-    return state.__anthropicBackgroundRefreshRunning
-  }
-
-  state.__anthropicBackgroundRefreshRunning = (async () => {
-    const store = await ensureAccountStore()
-    for (const label of sortedLabels(store)) {
-      const account = store.accounts[label]
-      if (!account || !shouldBackgroundRefreshAccount(account)) continue
-
-      try {
-        await refreshStoredAccount(store, label, client, true)
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        if (!isInvalidRefreshMessage(message)) {
-          await debugLog("background_account_refresh_failed", { label, message })
-        }
-      }
-    }
-  })().finally(() => {
-    state.__anthropicBackgroundRefreshRunning = undefined
-  })
-
-  return state.__anthropicBackgroundRefreshRunning
-}
-
-function ensureBackgroundRefreshLoop(client: Parameters<typeof BaseAnthropicAuthPlugin>[0]["client"]) {
-  if (BACKGROUND_REFRESH_INTERVAL_MS <= 0) return
-
-  const state = backgroundState()
-  if (state.__anthropicBackgroundRefreshTimer) return
-
-  void refreshAllAccountsInBackground(client)
-
-  const timer = setInterval(() => {
-    void refreshAllAccountsInBackground(client)
-  }, BACKGROUND_REFRESH_INTERVAL_MS)
-
-  if (typeof timer.unref === "function") {
-    timer.unref()
-  }
-
-  state.__anthropicBackgroundRefreshTimer = timer
+async function setCanonicalAuth(client: Parameters<Plugin>[0]["client"], account: StoredAccount) {
+  await client.auth.set({ path: { id: "anthropic" }, body: toOAuthBody(account) })
 }
 
 function cooldownUntil(account: StoredAccount) {
-  let value = 0
-  if (account.lastRateLimitAt) {
-    const timestamp = Date.parse(account.lastRateLimitAt)
-    if (Number.isFinite(timestamp)) {
-      value = Math.max(value, timestamp + RATE_LIMIT_COOLDOWN_MS)
-    }
-  }
-  if (!ENABLE_USAGE_POLLING) {
-    return value
-  }
-  if (usageValue(account.usage?.fiveHour) >= FIVE_HOUR_THRESHOLD) {
-    value = Math.max(value, resetTimestamp(account.usage?.fiveHour))
-  }
-  if (usageValue(account.usage?.sevenDay) >= SEVEN_DAY_THRESHOLD) {
-    value = Math.max(value, resetTimestamp(account.usage?.sevenDay))
-  }
-  return value
+  if (!account.lastRateLimitAt) return 0
+  const timestamp = Date.parse(account.lastRateLimitAt)
+  if (!Number.isFinite(timestamp)) return 0
+  return timestamp + RATE_LIMIT_COOLDOWN_MS
 }
 
-function overThresholdReason(account: StoredAccount) {
-  if (account.usage?.tokenExpired) return "token expired"
-  if (usageValue(account.usage?.sevenDay) >= SEVEN_DAY_THRESHOLD) {
-    return `seven-day usage ${usageValue(account.usage?.sevenDay).toFixed(0)}%`
-  }
-  if (usageValue(account.usage?.fiveHour) >= FIVE_HOUR_THRESHOLD) {
-    return `five-hour usage ${usageValue(account.usage?.fiveHour).toFixed(0)}%`
-  }
-  return undefined
+function pickNextAccount(store: AccountStore, currentLabel?: string, attempted?: Set<string>) {
+  return sortedLabels(store)
+    .filter((label) => label !== currentLabel)
+    .filter((label) => !attempted?.has(label))
+    .filter((label) => {
+      const account = store.accounts[label]
+      return account ? cooldownUntil(account) <= Date.now() : false
+    })[0]
 }
 
-function isAccountUsable(account: StoredAccount) {
-  if (account.usage?.refreshInvalid && account.expires <= Date.now() + 15_000) return false
-  if (account.usage?.tokenExpired) return false
-  return cooldownUntil(account) <= Date.now()
+function isAnthropicRateLimit(status: number, text: string) {
+  return status === 429 && /rate_limit_error|Rate limited/i.test(text)
 }
 
-function scoreAccount(label: string, account: StoredAccount) {
-  const sevenDay = usageValue(account.usage?.sevenDay)
-  const fiveHour = usageValue(account.usage?.fiveHour)
-  if (ACCOUNT_STRATEGY === "drain") {
-    return [-(sevenDay || 0), -(fiveHour || 0), label] as const
-  }
-  return [sevenDay || 0, fiveHour || 0, label] as const
-}
-
-function preferredLabel(store: AccountStore) {
-  const envLabel = sanitizeLabel(process.env.ANTHROPIC_ACCOUNT_LABEL ?? "")
-  if (envLabel && store.accounts[envLabel]) return envLabel
-  if (store.active && store.accounts[store.active]) return store.active
-  return sortedLabels(store)[0]
-}
-
-function labelForCanonicalAuth(store: AccountStore, auth: { access: string; refresh: string; expires: number }) {
-  for (const label of sortedLabels(store)) {
-    const account = store.accounts[label]
-    if (!account) continue
-    if (account.refresh === auth.refresh || account.access === auth.access) {
-      return label
-    }
-  }
-}
-
-async function resolveActiveSelection(getAuth: () => Promise<any>) {
-  const store = await ensureAccountStore()
-  const auth = await getAuth()
-  const matchedLabel = auth?.type === "oauth" ? labelForCanonicalAuth(store, auth) : undefined
-  const label = matchedLabel ?? preferredLabel(store)
-  if (label) {
-    if (auth?.type === "oauth" && (matchedLabel || Object.keys(store.accounts).length <= 1)) {
-      if (matchedLabel && store.active !== matchedLabel) {
-        store.active = matchedLabel
-        await saveAccountStore(store)
-      }
-      const synced = await syncStoredAccountFromCanonical(store, label, {
-        access: auth.access,
-        refresh: auth.refresh,
-        expires: auth.expires,
-      })
-      return {
-        store,
-        label,
-        account: synced,
-      }
-    }
-    return {
-      store,
-      label,
-      account: store.accounts[label],
-    }
-  }
-
-  if (auth?.type !== "oauth") return
-
-  const imported = await saveLabeledAccount(DEFAULT_IMPORTED_LABEL, {
-    access: auth.access,
-    refresh: auth.refresh,
-    expires: auth.expires,
-  }, {
-    activate: true,
-    reason: "Imported runtime OAuth credentials",
-  })
-
-  return imported
-}
-
-async function markRateLimited(store: AccountStore, label: string, errorText: string) {
-  if (!store.accounts[label]) return
-
-  await updateStoredAccount(store, label, (current) => ({
-    ...current,
-    lastRateLimitAt: nowIso(),
-    updatedAt: nowIso(),
-  }))
-
-  await debugLog("account_rate_limited", {
-    label,
-    error: errorText,
-  })
-}
-
-async function selectNextHealthyAccount(
-  store: AccountStore,
-  currentLabel: string,
-  attempted: Set<string>,
-  client: Parameters<typeof BaseAnthropicAuthPlugin>[0]["client"],
-) {
-  const labels = sortedLabels(store)
-    .filter((label) => label !== currentLabel && !attempted.has(label))
-    .sort((left, right) => {
-      const leftScore = scoreAccount(left, store.accounts[left])
-      const rightScore = scoreAccount(right, store.accounts[right])
-      if (leftScore[0] !== rightScore[0]) return leftScore[0] - rightScore[0]
-      if (leftScore[1] !== rightScore[1]) return leftScore[1] - rightScore[1]
-      return String(leftScore[2]).localeCompare(String(rightScore[2]))
-    })
-
-  for (const label of labels) {
-    const current = store.accounts[label]
-    if (current?.usage?.refreshInvalid) continue
-    try {
-      let account = await refreshStoredAccount(store, label, client)
-      account = await refreshStoredUsage(store, label)
-      if (!isAccountUsable(account)) continue
-      return {
-        store,
-        label,
-        account,
-      }
-    } catch (error) {
-      await debugLog("candidate_account_skipped", {
-        label,
-        message: error instanceof Error ? error.message : String(error),
-      })
-    }
-  }
-}
-
-async function activateHealthyAccount(
-  client: Parameters<typeof BaseAnthropicAuthPlugin>[0]["client"],
-  store: AccountStore,
-  label: string,
-  reason: string,
-) {
-  const account = await refreshStoredAccount(store, label, client)
-  await setActiveLabel(store, label, reason)
-  await setCanonicalAuth(client, account)
-  await debugLog("account_activated", { label, reason })
-  return {
-    store,
-    label,
-    account,
-  }
-}
-
-async function finalizeLoggedInAccount(
-  label: string,
-  auth: { access: string; refresh: string; expires: number },
-  makeActive: boolean,
-) {
-  const store = await ensureAccountStore()
-  const previousActive = preferredLabel(store)
-  const saved = await saveLabeledAccount(label, auth, {
-    activate: makeActive || !previousActive,
-    reason: makeActive ? "Added and activated account" : "Added account without activation",
-  })
-
-  if (makeActive || !previousActive) {
-    await debugLog("account_added", { label: saved.label, active: true })
-    return toOAuthSuccess(saved.account)
-  }
-
-  await debugLog("account_added", { label: saved.label, active: false })
-  const current = saved.store.accounts[previousActive]
-  return current ? toOAuthSuccess(current) : toOAuthSuccess(saved.account)
-}
-
-async function switchToStoredAccount(label: string, client: Parameters<typeof BaseAnthropicAuthPlugin>[0]["client"]) {
-  const store = await ensureAccountStore()
-  if (!store.accounts[label]) return { type: "failed" as const }
-  const account = await refreshStoredAccount(store, label, client)
-  await setActiveLabel(store, label, "Manual account switch")
-  await debugLog("account_switched_manually", { label })
-  return toOAuthSuccess(account)
-}
-
-function addCandidate(candidates: Candidate[], seen: Set<string>, code?: string | null, state?: string | null) {
-  if (!code || code === "true") return
-  const normalizedState = state || undefined
-  const key = normalizedState ? `${code}#${normalizedState}` : code
-  if (seen.has(key)) return
-  seen.add(key)
-  candidates.push({ code, state: normalizedState })
-}
-
-function addUrlCandidates(candidates: Candidate[], seen: Set<string>, url: URL, verifier: string) {
-  const queryCode = url.searchParams.get("code")
-  const queryState = url.searchParams.get("state")
-  const hash = url.hash.startsWith("#") ? url.hash.slice(1) : url.hash
-  const hashParams = new URLSearchParams(hash)
-  const hashCode = hashParams.get("code")
-  const hashState = hashParams.get("state")
-
-  addCandidate(candidates, seen, queryCode, queryState ?? hashState ?? hash ?? verifier)
-  addCandidate(candidates, seen, hashCode, hashState ?? queryState ?? verifier)
-}
-
-function getCandidates(value: string, verifier: string) {
-  const input = cleanInput(value)
-  const seen = new Set<string>()
-  const candidates: Candidate[] = []
-
-  if (!input) return candidates
-
-  if (input.startsWith("http://") || input.startsWith("https://")) {
-    try {
-      addUrlCandidates(candidates, seen, new URL(input), verifier)
-    } catch {}
-  }
-
-  if (input.includes("?") || input.includes("&")) {
-    try {
-      const params = new URLSearchParams(input.replace(/^[^?#]*[?#]/, ""))
-      addCandidate(candidates, seen, params.get("code"), params.get("state"))
-    } catch {}
-  }
-
-  const hashIndex = input.indexOf("#")
-  if (hashIndex !== -1) {
-    const left = input.slice(0, hashIndex)
-    const right = input.slice(hashIndex + 1)
-    addCandidate(candidates, seen, left, right)
-    addCandidate(candidates, seen, right, left)
-  }
-
-  addCandidate(candidates, seen, input, undefined)
-  return candidates
-}
-
-function buildAuthUrl(authorizeUrl: string, scopes: string[], verifier: string, challenge: string, redirectUri: string) {
-  const url = new URL(authorizeUrl)
-  url.searchParams.set("code", "true")
-  url.searchParams.set("client_id", CLIENT_ID)
-  url.searchParams.set("response_type", "code")
-  url.searchParams.set("redirect_uri", redirectUri)
-  url.searchParams.set("scope", scopes.join(" "))
-  url.searchParams.set("code_challenge", challenge)
-  url.searchParams.set("code_challenge_method", "S256")
-  url.searchParams.set("state", verifier)
-  return url.toString()
-}
-
-async function authorizeWithManualCode(value: string, attempt: PendingOAuthAttempt) {
-  const candidates = getCandidates(value, attempt.verifier)
-  const attempts = [
-    attempt,
-    ...(await listPendingOAuthAttempts({
-      purpose: attempt.purpose,
-      mode: "manual",
-      authorizeUrl: attempt.authorizeUrl,
-      redirectUri: attempt.redirectUri,
-    })).filter((item) => item.id !== attempt.id),
-  ]
-  let lastError = ""
-  let attemptsTried = 0
-
-  for (const [index, candidate] of candidates.entries()) {
-    for (const rankedAttempt of rankPendingAttempts(attempts, candidate, attempt)) {
-      if (candidate.state && candidate.state !== rankedAttempt.verifier) continue
-
-      attemptsTried += 1
-
-      try {
-        const state = candidate.state ?? rankedAttempt.verifier
-        const tokens = await exchangeCode(candidate.code, state, rankedAttempt.verifier, rankedAttempt.redirectUri)
-        await consumePendingOAuthAttempt(rankedAttempt.id)
-        return {
-          type: "success" as const,
-          access: tokens.access,
-          refresh: tokens.refresh,
-          expires: tokens.expires,
-          attempt: rankedAttempt,
-        }
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error)
-        await debugLog("manual_candidate_failed", {
-          redirectUri: rankedAttempt.redirectUri,
-          pendingAttemptID: rankedAttempt.id,
-          pendingAttemptPurpose: rankedAttempt.purpose,
-          pendingAttemptLabel: rankedAttempt.label,
-          index,
-          candidateCodeLength: candidate.code.length,
-          candidateStateLength: candidate.state?.length ?? 0,
-          lastError,
-        })
-      }
-    }
-  }
-
-  await debugLog("manual_exchange_failed", {
-    redirectUri: attempt.redirectUri,
-    inputLength: cleanInput(value).length,
-    candidatesTried: attemptsTried,
-    lastError,
-  })
-
-  return { type: "failed" as const }
-}
-
-function openBrowser(url: string) {
-  const commands = (() => {
-    if (process.platform === "darwin") return [["open", [url]]]
-    if (process.platform === "win32") return [["cmd", ["/c", "start", "", url]]]
-    return [
-      ["xdg-open", [url]],
-      ["wslview", [url]],
-    ]
-  })()
-
-  for (const [command, args] of commands) {
-    try {
-      const child = spawn(command, args, {
-        detached: true,
-        stdio: "ignore",
-      })
-      child.unref()
-      return true
-    } catch {}
-  }
-
-  return false
-}
-
-async function startLocalAuth(authorizeUrl: string, scopes: string[]) {
-  const pkce = await generatePKCE()
-  const server = createServer()
-  const callback = new Promise<{ code: string; state: string }>((resolve, reject) => {
-    let timeout: ReturnType<typeof setTimeout> | undefined
-
-    server.on("request", (request, response) => {
-      try {
-        const requestUrl = new URL(request.url ?? "/", `http://${LOCALHOST}`)
-        if (requestUrl.pathname !== "/callback") {
-          response.statusCode = 404
-          response.end("Not found")
-          return
-        }
-
-        const code = requestUrl.searchParams.get("code")
-        const state = requestUrl.searchParams.get("state")
-        if (!code || !state) {
-          response.statusCode = 400
-          response.setHeader("content-type", "text/plain; charset=utf-8")
-          response.end("Missing code or state in callback URL.")
-          return
-        }
-
-        response.statusCode = 302
-        response.setHeader("location", SUCCESS_URL)
-        response.end()
-        if (timeout) clearTimeout(timeout)
-        server.close()
-        resolve({ code, state })
-      } catch (error) {
-        if (timeout) clearTimeout(timeout)
-        server.close()
-        reject(error)
-      }
-    })
-
-    server.once("error", reject)
-    server.listen(0, LOCALHOST)
-
-    void once(server, "listening").then(() => {
-      timeout = setTimeout(() => {
-        server.close()
-        reject(new Error("Timed out waiting for the Anthropic browser callback."))
-      }, CALLBACK_TIMEOUT_MS)
-    })
-  })
-
-  await once(server, "listening")
-  const address = server.address()
-  if (!address || typeof address === "string") {
-    server.close()
-    throw new Error("Failed to allocate local callback port.")
-  }
-
-  const redirectUri = `http://${LOCALHOST}:${address.port}/callback`
-  const url = buildAuthUrl(authorizeUrl, scopes, pkce.verifier, pkce.challenge, redirectUri)
-
-  return {
-    url,
-    redirectUri,
-    verifier: pkce.verifier,
-    open: () => openBrowser(url),
-    async finish() {
-      const result = await callback
-      const tokens = await exchangeCode(result.code, result.state, pkce.verifier, redirectUri)
-      return {
-        type: "success" as const,
-        access: tokens.access,
-        refresh: tokens.refresh,
-        expires: tokens.expires,
-      }
-    },
-  }
-}
-
-function addAccountPrompts() {
-  return [
-    {
-      type: "text" as const,
-      key: "label",
-      message: "Account label",
-      placeholder: "personal",
-      validate: validateLabel,
-    },
-    {
-      type: "select" as const,
-      key: "makeActive",
-      message: "Make this the active account?",
-      options: [
-        { label: "Yes", value: "yes" },
-        { label: "No", value: "no" },
-      ],
-    },
-  ]
-}
-
-function createAddAutoAccountMethod(label: string, authorizeUrl: string, scopes: string[]) {
-  return {
-    label,
-    type: "oauth" as const,
-    prompts: addAccountPrompts(),
-    authorize: async (inputs?: Record<string, string>) => {
-      const accountLabel = sanitizeLabel(inputs?.label ?? "")
-      const makeActive = inputs?.makeActive !== "no"
-      const flow = await startLocalAuth(authorizeUrl, scopes)
-      const opened = flow.open()
-
-      return {
-        url: flow.url,
-        instructions: opened
-          ? "Browser opened. Waiting for the Anthropic callback for this labeled account."
-          : "Open the link in your browser. This auto flow only works when your browser can reach this machine's localhost callback.",
-        method: "auto" as const,
-        callback: async () => {
-          try {
-            const result = await flow.finish()
-            if (result.type === "failed") return result
-            return finalizeLoggedInAccount(accountLabel, result, makeActive)
-          } catch (error) {
-            await debugLog("auto_account_login_failed", {
-              label: accountLabel,
-              message: error instanceof Error ? error.message : String(error),
-            })
-            return { type: "failed" as const }
-          }
-        },
-      }
-    },
-  }
-}
-
-function createAddManualAccountMethod(label: string, authorizeUrl: string, scopes: string[]) {
-  return {
-    label,
-    type: "oauth" as const,
-    prompts: addAccountPrompts(),
-    authorize: async (inputs?: Record<string, string>) => {
-      const accountLabel = sanitizeLabel(inputs?.label ?? "")
-      const makeActive = inputs?.makeActive !== "no"
-      const pkce = await generatePKCE()
-      const url = buildAuthUrl(authorizeUrl, scopes, pkce.verifier, pkce.challenge, MANUAL_REDIRECT_URL)
-      const opened = openBrowser(url)
-      const attempt = await registerPendingOAuthAttempt(
-        createPendingOAuthAttempt({
-          purpose: "account",
-          mode: "manual",
-          authorizeUrl,
-          redirectUri: MANUAL_REDIRECT_URL,
-          verifier: pkce.verifier,
-          label: accountLabel,
-          makeActive,
-        }),
-      )
-
-      return {
-        url,
-        instructions: opened
-          ? "Browser opened. Finish Anthropic login, then paste the final callback URL, the returned code#state value, or the raw Authentication Code here."
-          : "Open the link, finish Anthropic login, then paste the final callback URL, the returned code#state value, or the raw Authentication Code here.",
-        method: "code" as const,
-        callback: async (value: string) => {
-          const result = await authorizeWithManualCode(value, attempt)
-          if (result.type === "failed") return result
-          return finalizeLoggedInAccount(result.attempt.label ?? accountLabel, result, result.attempt.makeActive ?? makeActive)
-        },
-      }
-    },
-  }
-}
-
-function createSwitchAccountMethod(label: string, client: Parameters<typeof BaseAnthropicAuthPlugin>[0]["client"]) {
-  return {
-    label: `Use saved account: ${label}`,
-    type: "oauth" as const,
-    authorize: async () => ({
-      url: "",
-      instructions: `Switching to saved Anthropic account \"${label}\"...`,
-      method: "auto" as const,
-      callback: async () => {
-        try {
-          return await switchToStoredAccount(label, client)
-        } catch (error) {
-          await debugLog("manual_switch_failed", {
-            label,
-            message: error instanceof Error ? error.message : String(error),
-          })
-          return { type: "failed" as const }
-        }
-      },
-    }),
-  }
-}
-
-function extractSystemText(system: unknown) {
-  if (Array.isArray(system)) {
-    return system
-      .filter((item): item is { type?: string; text?: string } => Boolean(item && typeof item === "object"))
-      .filter((item) => item.type === "text" && typeof item.text === "string")
-      .map((item) => item.text)
-      .join("\n\n")
-  }
-
-  if (typeof system === "string") return system
-  return ""
-}
-
-function stripClaudeCodePrompt(value: string) {
-  return value.split(CLAUDE_CODE_SYSTEM_PROMPT).join("").trim()
-}
-
-async function prepareRequest(request: RequestInfo | URL, init?: RequestInit): Promise<PreparedRequest> {
-  const headers = new Headers()
-  if (request instanceof Request) {
-    request.headers.forEach((value, key) => {
-      headers.set(key, value)
-    })
-  }
-  if (init?.headers) {
-    new Headers(init.headers).forEach((value, key) => {
-      headers.set(key, value)
-    })
-  }
-
-  const requestInit: RequestInit = request instanceof Request
-    ? {
-        method: request.method,
-        cache: request.cache,
-        credentials: request.credentials,
-        integrity: request.integrity,
-        keepalive: request.keepalive,
-        mode: request.mode,
-        redirect: request.redirect,
-        referrer: request.referrer,
-        referrerPolicy: request.referrerPolicy,
-        signal: request.signal,
-      }
-    : {}
-
-  if (init) Object.assign(requestInit, init)
-
-  let finalUrl: string | null = null
-  try {
-    if (typeof request === "string" || request instanceof URL) {
-      finalUrl = request.toString()
-    } else if (request instanceof Request) {
-      finalUrl = request.url
-    }
-  } catch {}
-
-  let body = requestInit.body
-  if (body === undefined && request instanceof Request && request.method !== "GET" && request.method !== "HEAD") {
-    try {
-      body = await request.clone().text()
-    } catch {
-      body = request.body ?? undefined
-    }
-  }
-
-  return {
-    original: request,
-    finalUrl,
-    requestInit,
-    headers,
-    body,
-  }
-}
-
-function buildRuntimeRequest(prepared: PreparedRequest, accessToken: string) {
-  const headers = new Headers(prepared.headers)
-  const requestInit: RequestInit = {
-    ...prepared.requestInit,
-  }
-
-  let finalUrl = prepared.finalUrl
-  let body = prepared.body
-
-  headers.set("authorization", `Bearer ${accessToken}`)
-  headers.set("user-agent", CLAUDE_CODE_USER_AGENT)
-  headers.set("x-app", "cli")
-  headers.delete("x-api-key")
-
-  if (finalUrl && finalUrl.includes("/v1/messages")) {
-    const url = new URL(finalUrl)
-    if (!url.searchParams.has("beta")) {
-      url.searchParams.set("beta", "true")
-    }
-    finalUrl = url.toString()
-    headers.set("anthropic-beta", CLAUDE_CODE_BETA_HEADERS)
-
-    if (typeof body === "string") {
-      try {
-        const parsed = JSON.parse(body)
-        const customSystemText = stripClaudeCodePrompt(extractSystemText(parsed.system))
-
-        parsed.system = CLAUDE_CODE_SYSTEM_PROMPT
-
-        if (customSystemText) {
-          const messages = Array.isArray(parsed.messages) ? parsed.messages : []
-          messages.unshift({
-            role: "user",
-            content: `[System Instructions]\n${customSystemText}`,
-          })
-          messages.splice(1, 0, {
-            role: "assistant",
-            content: "Understood. I'll follow these instructions.",
-          })
-          parsed.messages = messages
-        }
-
-        if (Array.isArray(parsed.tools)) {
-          parsed.tools = parsed.tools.map((tool: Record<string, unknown>) => ({
-            ...tool,
-            name: typeof tool.name === "string" && !tool.name.startsWith(MCP_TOOL_PREFIX)
-              ? `${MCP_TOOL_PREFIX}${tool.name}`
-              : tool.name,
-          }))
-        }
-
-        if (Array.isArray(parsed.messages)) {
-          parsed.messages = parsed.messages.map((message: Record<string, unknown>) => {
-            if (!Array.isArray(message.content)) return message
-
-            return {
-              ...message,
-              content: message.content.map((block: Record<string, unknown>) => {
-                if (block.type !== "tool_use" || typeof block.name !== "string") return block
-                if (block.name.startsWith(MCP_TOOL_PREFIX)) return block
-                return {
-                  ...block,
-                  name: `${MCP_TOOL_PREFIX}${block.name}`,
-                }
-              }),
-            }
-          })
-        }
-
-        body = JSON.stringify(parsed)
-      } catch {}
-    }
-  }
-
-  return {
-    url: finalUrl ?? prepared.original,
-    init: {
-      ...requestInit,
-      body,
-      headers,
-    } as RequestInit,
-  }
-}
-
-function isRateLimitError(status: number, text: string) {
-  if (status !== 429) return false
-  return /rate_limit_error|Rate limited/i.test(text) || status === 429
-}
-
-function isTokenExpiredError(status: number, text: string) {
-  return status === 401 && /token_expired|OAuth token has expired|authentication_error/i.test(text)
+function isAnthropicAuthFailure(status: number, text: string) {
+  if (![401, 403].includes(status)) return false
+  return /invalid authentication credentials|oauth authentication is currently not allowed|authentication_error|token_expired/i.test(text)
 }
 
 function rebuildResponse(response: Response, text: string) {
@@ -1646,229 +278,167 @@ function rebuildResponse(response: Response, text: string) {
   })
 }
 
-function transformResponse(response: Response) {
-  if (!response.body) return response
-
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  const encoder = new TextEncoder()
-
-  const stream = new ReadableStream({
-    async pull(controller) {
-      const { done, value } = await reader.read()
-      if (done) {
-        controller.close()
-        return
-      }
-
-      let text = decoder.decode(value, { stream: true })
-      text = text.replace(/"name"\s*:\s*"mcp_([^"]+)"/g, '"name": "$1"')
-      controller.enqueue(encoder.encode(text))
-    },
-  })
-
-  return new Response(stream, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  })
+function accountLabelPrompt() {
+  return {
+    type: "text" as const,
+    key: "label",
+    message: "Account label",
+    placeholder: "personal",
+    validate: validateLabel,
+  }
 }
 
-export async function AnthropicAuthPlugin(input: Parameters<typeof BaseAnthropicAuthPlugin>[0]) {
-  const hooks = await BaseAnthropicAuthPlugin(input)
-  if (!hooks.auth || hooks.auth.provider !== "anthropic") return hooks
+function activatePrompt() {
+  return {
+    type: "select" as const,
+    key: "makeActive",
+    message: "Make this the active account?",
+    options: [
+      { label: "Yes", value: "yes" },
+      { label: "No", value: "no" },
+    ],
+  }
+}
 
-  const initialStore = await ensureAccountStore()
-  const switchMethods = sortedLabels(initialStore).map((label) => createSwitchAccountMethod(label, input.client))
-  const baseLoader = hooks.auth.loader?.bind(hooks.auth)
-  ensureBackgroundRefreshLoop(input.client)
+function createAddAccountMethod(
+  baseMethod: NonNullable<Awaited<ReturnType<typeof builtInAnthropicAuthPlugin>>["auth"]>["methods"][number],
+) {
+  return {
+    label: "Add Claude Pro/Max Account",
+    type: "oauth" as const,
+    prompts: [accountLabelPrompt(), activatePrompt()],
+    authorize: async (inputs?: Record<string, string>) => {
+      const beforeCanonical = await loadCanonicalAnthropicAuth()
+      const store = await ensureAccountStore()
+      const beforeLabel = beforeCanonical ? labelForAuth(store, beforeCanonical) ?? store.active : store.active
+      const accountLabel = sanitizeLabel(inputs?.label ?? "")
+      const makeActive = inputs?.makeActive !== "no"
+      const result = await baseMethod.authorize(inputs)
+
+      return {
+        ...result,
+        callback: async (...args: [string?]) => {
+          const authResult = result.method === "code" ? await result.callback(args[0]!) : await result.callback()
+          if (!authResult || authResult.type !== "success" || !("refresh" in authResult)) {
+            return authResult
+          }
+
+          const latestStore = await ensureAccountStore()
+          const saved = await upsertAccount(latestStore, accountLabel, authResult, "Added saved Anthropic account")
+
+          if (makeActive || !beforeCanonical) {
+            await setActiveLabel(latestStore, saved.label, "Added and activated account")
+            return authResult
+          }
+
+          if (beforeLabel && latestStore.accounts[beforeLabel]) {
+            await setActiveLabel(latestStore, beforeLabel, "Added account without activation")
+          }
+
+          return {
+            type: "success" as const,
+            refresh: beforeCanonical.refresh,
+            access: beforeCanonical.access,
+            expires: beforeCanonical.expires,
+          }
+        },
+      }
+    },
+  }
+}
+
+function createUseSavedAccountMethod(client: Parameters<Plugin>[0]["client"], store: AccountStore) {
+  const options = sortedLabels(store).map((label) => ({ label, value: label }))
+  if (options.length === 0) return
 
   return {
-    ...hooks,
+    label: "Use saved Anthropic account",
+    type: "oauth" as const,
+    prompts: [
+      {
+        type: "select" as const,
+        key: "label",
+        message: "Saved account",
+        options,
+      },
+    ],
+    authorize: async (inputs?: Record<string, string>) => ({
+      url: "",
+      instructions: `Switching to saved Anthropic account \"${inputs?.label ?? ""}\"...`,
+      method: "auto" as const,
+      callback: async () => {
+        const label = sanitizeLabel(inputs?.label ?? "")
+        const latestStore = await ensureAccountStore()
+        const account = latestStore.accounts[label]
+        if (!account) return { type: "failed" as const }
+        await setActiveLabel(latestStore, label, "Manual account switch")
+        await setCanonicalAuth(client, account)
+        return toOAuthSuccess(account)
+      },
+    }),
+  }
+}
+
+export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
+  const builtIn = await builtInAnthropicAuthPlugin({ client })
+  if (!builtIn.auth || builtIn.auth.provider !== "anthropic") return builtIn
+
+  const baseAuth = builtIn.auth
+  const store = await ensureAccountStore()
+  const claudeProMethod = baseAuth.methods.find((method) => method.label === "Claude Pro/Max")
+  if (!claudeProMethod) return builtIn
+  const addAccountMethod = createAddAccountMethod(claudeProMethod)
+  const useSavedAccountMethod = createUseSavedAccountMethod(client, store)
+
+  return {
+    ...builtIn,
     auth: {
-      ...hooks.auth,
-      loader: baseLoader
+      ...baseAuth,
+      methods: [
+        addAccountMethod,
+        ...(useSavedAccountMethod ? [useSavedAccountMethod] : []),
+        ...baseAuth.methods.slice(1),
+      ],
+      loader: baseAuth.loader
         ? async (getAuth, provider) => {
-            const loaded = await baseLoader(getAuth, provider)
+            const loaded = await baseAuth.loader!(getAuth, provider)
             if (!loaded.fetch) return loaded
 
             return {
               ...loaded,
-              async fetch(request, init) {
-                const fallbackAuth = await getAuth()
-                if (fallbackAuth.type !== "oauth") return loaded.fetch(request, init)
-
-                const prepared = await prepareRequest(request, init)
-                const attempted = new Set<string>()
-                let selection = await resolveActiveSelection(getAuth)
-                if (!selection) return loaded.fetch(request, init)
-
-                selection.account = await refreshStoredAccount(selection.store, selection.label, input.client)
-                if (selection.account.usage?.refreshInvalid) {
-                  attempted.add(selection.label)
-                  const next = await selectNextHealthyAccount(selection.store, selection.label, attempted, input.client)
-                  if (next) {
-                    selection = await activateHealthyAccount(
-                      input.client,
-                      next.store,
-                      next.label,
-                      "Switch away from invalid refresh token",
-                    )
-                  }
-                }
-                if (!selection) return loaded.fetch(request, init)
-                if (Object.keys(selection.store.accounts).length > 1) {
-                  selection.account = await refreshStoredUsage(selection.store, selection.label)
-                  if (!isAccountUsable(selection.account)) {
-                    attempted.add(selection.label)
-                    const next = await selectNextHealthyAccount(selection.store, selection.label, attempted, input.client)
-                    if (next) {
-                      selection = await activateHealthyAccount(input.client, next.store, next.label, overThresholdReason(selection.account) ?? "Pre-emptive account rotation")
-                    }
-                  }
+              async fetch(input, init) {
+                const latestStore = await ensureAccountStore()
+                if (Object.keys(latestStore.accounts).length < 2) {
+                  return loaded.fetch!(input, init)
                 }
 
-                const forcedRefresh = new Set<string>()
+                const response = await loaded.fetch!(input, init)
 
-                while (selection) {
-                  attempted.add(selection.label)
-                  const runtime = buildRuntimeRequest(prepared, selection.account.access)
-                  const response = await fetch(runtime.url, runtime.init)
-
-                  if (response.status === 429) {
-                    const text = await response.text().catch(() => "")
-                    if (!isRateLimitError(response.status, text)) {
-                      return rebuildResponse(response, text)
-                    }
-
-                    await markRateLimited(selection.store, selection.label, text)
-                    const next = await selectNextHealthyAccount(selection.store, selection.label, attempted, input.client)
-                    if (!next) return rebuildResponse(response, text)
-                    selection = await activateHealthyAccount(input.client, next.store, next.label, "Anthropic rate limit failover")
-                    continue
-                  }
-
-                  if (response.status === 401) {
-                    const text = await response.text().catch(() => "")
-                    if (isTokenExpiredError(response.status, text) && !forcedRefresh.has(selection.label)) {
-                      forcedRefresh.add(selection.label)
-                      try {
-                        selection.account = await refreshStoredAccount(selection.store, selection.label, input.client, true)
-                        await setCanonicalAuth(input.client, selection.account)
-                        continue
-                      } catch {
-                        const next = await selectNextHealthyAccount(selection.store, selection.label, attempted, input.client)
-                        if (next) {
-                          selection = await activateHealthyAccount(input.client, next.store, next.label, "Expired token failover")
-                          continue
-                        }
-                      }
-                    }
-                    return rebuildResponse(response, text)
-                  }
-
-                  return transformResponse(response)
+                const text = await response.text().catch(() => "")
+                if (!isAnthropicRateLimit(response.status, text) && !isAnthropicAuthFailure(response.status, text)) {
+                  return rebuildResponse(response, text)
                 }
 
-                return loaded.fetch(request, init)
+                const canonical = await loadCanonicalAnthropicAuth()
+                const currentLabel = canonical ? labelForAuth(latestStore, canonical) ?? latestStore.active : latestStore.active
+                if (currentLabel && latestStore.accounts[currentLabel] && isAnthropicRateLimit(response.status, text)) {
+                  latestStore.accounts[currentLabel].lastRateLimitAt = nowIso()
+                  await saveAccountStore(latestStore)
+                }
+
+                const nextLabel = pickNextAccount(latestStore, currentLabel)
+                if (!nextLabel) {
+                  return rebuildResponse(response, text)
+                }
+
+                const next = latestStore.accounts[nextLabel]
+                await setActiveLabel(latestStore, nextLabel, isAnthropicRateLimit(response.status, text) ? "Anthropic rate limit failover" : "Anthropic auth failover")
+                await setCanonicalAuth(client, next)
+                return loaded.fetch!(input, init)
               },
             }
           }
         : undefined,
-      methods: [
-        createAddAutoAccountMethod("Add Claude Pro/Max Account", CLAUDE_AI_AUTHORIZE_URL, CLAUDE_AI_SCOPES),
-        createAddManualAccountMethod(
-          "Add Claude Pro/Max Account (Manual / Remote)",
-          CLAUDE_AI_AUTHORIZE_URL,
-          CLAUDE_AI_SCOPES,
-        ),
-        ...switchMethods,
-        {
-          label: "Create an API Key",
-          type: "oauth" as const,
-          authorize: async () => {
-            const flow = await startLocalAuth(CONSOLE_AUTHORIZE_URL, CONSOLE_SCOPES)
-            const opened = flow.open()
-
-            return {
-              url: flow.url,
-              instructions: opened
-                ? "Browser opened. Waiting for the Anthropic callback. Press c to copy the URL if you need to reopen it."
-                : "Open the link in your browser. This auto flow only works when your browser can reach this machine's localhost callback.",
-              method: "auto" as const,
-              callback: async () => {
-                try {
-                  const credentials = await flow.finish()
-                  if (credentials.type === "failed") return credentials
-
-                  const response = await fetch(API_KEY_URL, {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                      authorization: `Bearer ${credentials.access}`,
-                    },
-                  })
-                  if (!response.ok) return { type: "failed" as const }
-
-                  const result = (await response.json()) as { raw_key?: string }
-                  if (!result.raw_key) return { type: "failed" as const }
-                  return { type: "success" as const, key: result.raw_key }
-                } catch {
-                  return { type: "failed" as const }
-                }
-              },
-            }
-          },
-        },
-        {
-          label: "Create an API Key (Manual / Remote)",
-          type: "oauth" as const,
-          authorize: async () => {
-            const pkce = await generatePKCE()
-            const url = buildAuthUrl(CONSOLE_AUTHORIZE_URL, CONSOLE_SCOPES, pkce.verifier, pkce.challenge, MANUAL_REDIRECT_URL)
-            const opened = openBrowser(url)
-            const attempt = await registerPendingOAuthAttempt(
-              createPendingOAuthAttempt({
-                purpose: "api_key",
-                mode: "manual",
-                authorizeUrl: CONSOLE_AUTHORIZE_URL,
-                redirectUri: MANUAL_REDIRECT_URL,
-                verifier: pkce.verifier,
-              }),
-            )
-
-            return {
-              url,
-              instructions: opened
-                ? "Browser opened. Finish Anthropic login, then paste the final callback URL, the returned code#state value, or the raw Authentication Code here."
-                : "Open the link, finish Anthropic login, then paste the final callback URL, the returned code#state value, or the raw Authentication Code here.",
-              method: "code" as const,
-              callback: async (value: string) => {
-                const credentials = await authorizeWithManualCode(value, attempt)
-                if (credentials.type === "failed") return credentials
-
-                const response = await fetch(API_KEY_URL, {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    authorization: `Bearer ${credentials.access}`,
-                  },
-                })
-                if (!response.ok) return { type: "failed" as const }
-
-                const result = (await response.json()) as { raw_key?: string }
-                if (!result.raw_key) return { type: "failed" as const }
-                return { type: "success" as const, key: result.raw_key }
-              },
-            }
-          },
-        },
-        {
-          provider: "anthropic",
-          label: "Manually enter API Key",
-          type: "api" as const,
-        },
-      ],
     },
   }
 }

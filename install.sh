@@ -5,7 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 PLUGIN_DIR="$CONFIG_DIR/plugins"
 PACKAGE_JSON="$CONFIG_DIR/package.json"
-OPENCODE_JSON="$CONFIG_DIR/opencode.json"
 PLUGIN_FILE="$PLUGIN_DIR/opencode-anthropic-auth.ts"
 SOURCE_PLUGIN="$SCRIPT_DIR/src/opencode-anthropic-auth.ts"
 
@@ -34,48 +33,11 @@ if deps is None:
 if not isinstance(deps, dict):
     raise SystemExit(f"{package_json}: dependencies must be an object")
 
-deps["@opencode-ai/plugin"] = deps.get("@opencode-ai/plugin", "1.4.0")
-deps["opencode-anthropic-auth"] = "0.0.13"
-deps["proper-lockfile"] = "4.1.2"
+deps["kimaki"] = deps.get("kimaki", "0.5.0")
 data["dependencies"] = deps
 
 with open(package_json, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, sort_keys=True)
-    f.write("\n")
-PY
-
-python3 - "$OPENCODE_JSON" <<'PY'
-import json
-import os
-import sys
-
-config_path = sys.argv[1]
-plugin_name = "opencode-anthropic-auth@0.0.13"
-
-data = {}
-if os.path.exists(config_path):
-    with open(config_path, "r", encoding="utf-8") as f:
-        raw = f.read().strip()
-        if raw:
-            data = json.loads(raw)
-
-if not isinstance(data, dict):
-    raise SystemExit(f"{config_path} must contain a JSON object")
-
-plugins = data.get("plugin")
-if plugins is None:
-    plugins = []
-if not isinstance(plugins, list):
-    raise SystemExit(f"{config_path}: plugin must be an array when present")
-
-if plugin_name not in plugins:
-    plugins.append(plugin_name)
-
-data.setdefault("$schema", "https://opencode.ai/config.json")
-data["plugin"] = plugins
-
-with open(config_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2)
     f.write("\n")
 PY
 
@@ -102,7 +64,6 @@ echo "2. Run: opencode providers login --provider anthropic"
 echo
 echo "Available Anthropic methods should include:"
 echo "  - Add Claude Pro/Max Account"
-echo "  - Add Claude Pro/Max Account (Manual / Remote)"
-echo "  - Use saved account: <label>"
+echo "  - Use saved Anthropic account"
 echo "  - Create an API Key"
-echo "  - Create an API Key (Manual / Remote)"
+echo "  - Manually enter API Key"

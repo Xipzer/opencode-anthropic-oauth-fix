@@ -1,4 +1,4 @@
-# Opencode Anthropic OAuth Fix
+# Kimaki Anthropic Accounts
 
 Thin multi-account extension for **Kimaki's built-in Anthropic plugin**.
 
@@ -17,8 +17,8 @@ This version includes:
 ## Quick install
 
 ```bash
-git clone https://github.com/Xipzer/opencode-anthropic-oauth-fix.git
-cd opencode-anthropic-oauth-fix
+git clone https://github.com/Xipzer/kimaki-anthropic-accounts.git
+cd kimaki-anthropic-accounts
 chmod +x install.sh
 bash ./install.sh
 ```
@@ -30,8 +30,8 @@ Then restart OpenCode/Kimaki or start a fresh session.
 If you only want to remove this repo's local multi-account wrapper and saved-account sidecar files while keeping Kimaki's built-in Anthropic behavior, run:
 
 ```bash
-git clone https://github.com/Xipzer/opencode-anthropic-oauth-fix.git
-cd opencode-anthropic-oauth-fix
+git clone https://github.com/Xipzer/kimaki-anthropic-accounts.git
+cd kimaki-anthropic-accounts
 chmod +x uninstall.sh
 bash ./uninstall.sh
 ```
